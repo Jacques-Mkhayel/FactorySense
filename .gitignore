@@ -1,0 +1,15 @@
+# Secrets
+.env
+config/mosquitto/certs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

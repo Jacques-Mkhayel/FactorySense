@@ -1,0 +1,68 @@
+%YAML 1.1
+---
+# Minimal Suricata config for FactorySense. Suricata runs inside the edge-gateway's network
+# namespace, so eth0/eth1 are the gateway's two legs: plant_net and cloud_net.
+
+vars:
+  address-groups:
+    PLANT_NET: "172.28.10.0/24"
+    CLOUD_NET: "172.28.20.0/24"
+    HOME_NET: "[$PLANT_NET,$CLOUD_NET]"
+    EXTERNAL_NET: "!$HOME_NET"
+  port-groups:
+    MODBUS_PORTS: "502"
+    MQTT_PORTS: "8883"
+
+default-log-dir: /var/log/suricata
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - anomaly
+        - stats:
+            totals: yes
+            threads: no
+
+# Both interfaces: Docker does not guarantee which one is plant_net and which is cloud_net.
+# One thread each: prototype traffic is tiny and this runs on student laptops.
+af-packet:
+  - interface: eth0
+    cluster-id: 98
+    cluster-type: cluster_flow
+    threads: 1
+    defrag: yes
+  - interface: eth1
+    cluster-id: 99
+    cluster-type: cluster_flow
+    threads: 1
+    defrag: yes
+
+# Modbus must be enabled explicitly; it is what lets rules tell a read from a write.
+# MQTT runs over TLS, so Suricata only sees the handshake, not topics or payloads.
+app-layer:
+  protocols:
+    modbus:
+      enabled: yes
+      detection-ports:
+        dp: 502
+    tls:
+      enabled: yes
+
+stats:
+  enabled: yes
+  interval: 30
+
+# Used by the container healthcheck (suricatasc -c uptime).
+unix-command:
+  enabled: yes
+
+default-rule-path: /config/rules
+rule-files:
+  - local.rules
+
+classification-file: /etc/suricata/classification.config
+reference-config-file: /etc/suricata/reference.config

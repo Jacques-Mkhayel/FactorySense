@@ -1,0 +1,19 @@
+# Least privilege per client. The broker silently discards any publish outside these topics,
+# which is one of the signals for the intrusion-detection demo.
+# Topic layout: factorysense/<kind>/<site>/<machine>
+
+# Anonymous clients (only possible on the container-local healthcheck listener): broker uptime only.
+topic read $SYS/broker/uptime
+
+# Edge gateway: publishes plant data, nothing else.
+user gateway
+topic write factorysense/telemetry/#
+topic write factorysense/status/#
+
+# Telegraf ingestor: reads telemetry to store it in TimescaleDB.
+user ingestor
+topic read factorysense/telemetry/#
+
+# Rules engine: reads telemetry to evaluate it; alerts go straight to the database.
+user rules-engine
+topic read factorysense/telemetry/#

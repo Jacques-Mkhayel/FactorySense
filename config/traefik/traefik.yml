@@ -1,0 +1,32 @@
+# Traefik static configuration.
+
+# aliasHeadersStrategy: drop headers like X_Forwarded_For that backends would read as X-Forwarded-For.
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      aliasHeadersStrategy: delete
+  # Internal only (not published): serves the ping endpoint used by the healthcheck.
+  traefik:
+    address: ":8080"
+    http:
+      aliasHeadersStrategy: delete
+
+providers:
+  # Discovers containers (and every api replica) from their labels.
+  docker:
+    exposedByDefault: false
+    network: factorysense_cloud_net
+  # Shared middlewares that do not belong to a single container.
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# Enables `traefik healthcheck --ping` for the container healthcheck.
+ping: {}
+
+log:
+  level: INFO
+accessLog: {}
+
+# TODO(debug): expose the dashboard behind the debug profile to show api replicas live.

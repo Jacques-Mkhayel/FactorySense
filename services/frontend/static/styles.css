@@ -1,0 +1,6 @@
+:root { --fg: #1f2933; --bg: #f5f7fa; --ok: #1b7f3b; --error: #b42318; }
+body { margin: 0; font-family: system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+header, main { padding: 1rem 2rem; }
+header p { margin: 0; opacity: 0.7; }
+.ok { color: var(--ok); }
+.error { color: var(--error); }

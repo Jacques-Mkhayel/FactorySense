@@ -1,0 +1,3 @@
+-- Runs once, after 010-telemetry.sh, on the first start with an empty timescaledb-data volume.
+-- TODO(phase 2): tables for assets, users, alerts (with source = 'equipment' | 'ids') and work orders,
+-- plus least-privilege roles for the ingestor, rules-engine and api instead of the superuser.

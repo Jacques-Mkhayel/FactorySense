@@ -1,0 +1,298 @@
+# FactorySense — industrial IoT monitoring prototype (Phase 1: skeleton).
+# Hybrid edge/cloud architecture: plant_net is the OT network, cloud_net is the public cloud.
+# The edge-gateway is the only container attached to both, which makes the trust boundary real.
+
+name: factorysense
+
+# Liveness probe shared by the Python stubs: stdlib only, so no curl/wget in the images.
+x-stub-healthcheck: &stub-healthcheck
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 10s
+
+services:
+
+  # ---------------------------------------------------------------- PLANT FLOOR
+
+  # why this exists: stands in for a PLC exposing a read-only register map over Modbus TCP.
+  # It lives only on plant_net, so it has no route to any cloud service (demo 5).
+  simulator:
+    build: ./services/simulator
+    init: true
+    environment:
+      SERVICE_NAME: simulator
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MACHINE_ID: ${MACHINE_ID:-press-01}
+      MODBUS_PORT: 502
+    networks: [plant_net]
+    healthcheck: *stub-healthcheck
+    restart: unless-stopped
+
+  # why this exists: the only bridge between OT and cloud. Polls the machine, computes features,
+  # applies local rules, buffers on WAN loss and publishes outbound over MQTT/TLS.
+  # It listens on no network port, so nothing in the cloud can call into the plant.
+  edge-gateway:
+    build: ./services/edge-gateway
+    init: true
+    environment:
+      SERVICE_NAME: edge-gateway
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SITE_ID: ${SITE_ID:-plant-01}
+      MODBUS_HOST: simulator
+      MODBUS_PORT: 502
+      MODBUS_UNIT_ID: 1
+      POLL_INTERVAL_S: ${POLL_INTERVAL_S:-1}
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 8883
+      MQTT_USER: gateway
+      MQTT_PASSWORD: ${MQTT_GATEWAY_PASSWORD:?set MQTT_GATEWAY_PASSWORD in .env}
+      MQTT_CA_FILE: /certs/ca.crt
+      BUFFER_PATH: /var/lib/gateway/buffer.db
+      BUFFER_RETENTION_H: ${GATEWAY_BUFFER_RETENTION_H:-72}
+    volumes:
+      - gateway-buffer:/var/lib/gateway
+      - mqtt-tls-ca:/certs:ro
+    networks: [plant_net, cloud_net]
+    # Deliberately NOT depending on mosquitto: the gateway must start and keep running
+    # while the WAN/broker is down, buffering locally (demo 4).
+    depends_on:
+      simulator: { condition: service_healthy }
+      mqtt-certs: { condition: service_completed_successfully }
+    healthcheck: *stub-healthcheck
+    restart: unless-stopped
+
+  # why this exists: network IDS on the trust boundary. It shares the gateway's network namespace,
+  # so it sees every packet crossing plant_net <-> cloud_net (a sniffer on its own bridge would see nothing).
+  # Security alerts land in eve.json and will feed the same alert pipeline as equipment alerts (demo 6).
+  ids:
+    image: jasonish/suricata:8.0
+    network_mode: "service:edge-gateway"
+    cap_add: [NET_ADMIN, NET_RAW, SYS_NICE]
+    command: ["-c", "/config/suricata.yaml", "--af-packet"]
+    volumes:
+      - ./config/suricata:/config:ro
+      - ids-logs:/var/log/suricata
+    depends_on:
+      edge-gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "suricatasc", "-c", "uptime", "/var/run/suricata/suricata-command.socket"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------- PUBLIC CLOUD
+
+  # why this exists: one-shot job that creates the broker's TLS certificate on first start, so MQTT
+  # runs over TLS 8883 without committing keys or needing openssl on the host. It has no healthcheck
+  # because it exits; dependants wait for service_completed_successfully instead.
+  mqtt-certs:
+    image: python:3.12-slim  # reused only for its openssl binary, already the base of our stubs
+    command: ["/bin/sh", "/scripts/gen-certs.sh"]
+    environment:
+      MQTT_TLS_HOSTNAME: mosquitto
+    volumes:
+      - ./config/mosquitto/gen-certs.sh:/scripts/gen-certs.sh:ro
+      - mqtt-tls-server:/tls/server
+      - mqtt-tls-ca:/tls/ca
+    network_mode: none
+    restart: "no"
+
+  # why this exists: MQTT broker that decouples producers from consumers and authenticates devices.
+  # TLS only on the network; every client has its own user and an ACL restricting its topics.
+  mosquitto:
+    image: eclipse-mosquitto:2.1-alpine
+    entrypoint: ["/bin/sh", "/mosquitto/config/entrypoint.sh"]
+    command: ["/usr/sbin/mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]
+    environment:
+      MQTT_GATEWAY_PASSWORD: ${MQTT_GATEWAY_PASSWORD:?set MQTT_GATEWAY_PASSWORD in .env}
+      MQTT_INGESTOR_PASSWORD: ${MQTT_INGESTOR_PASSWORD:?set MQTT_INGESTOR_PASSWORD in .env}
+      MQTT_RULES_PASSWORD: ${MQTT_RULES_PASSWORD:?set MQTT_RULES_PASSWORD in .env}
+    volumes:
+      - ./config/mosquitto:/mosquitto/config:ro
+      - mosquitto-data:/mosquitto/data
+      - mqtt-tls-server:/mosquitto/tls:ro
+    networks: [cloud_net]
+    depends_on:
+      mqtt-certs: { condition: service_completed_successfully }
+    healthcheck:
+      # Uses the container-local anonymous listener, which can only read the uptime topic.
+      test: ["CMD", "mosquitto_sub", "-h", "127.0.0.1", "-p", "1880", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # why this exists: MQTT -> TimescaleDB ingestion as pure configuration (Telegraf), not custom code.
+  ingestor:
+    image: telegraf:1.40-alpine
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 8883
+      MQTT_USER: ingestor
+      MQTT_PASSWORD: ${MQTT_INGESTOR_PASSWORD:?set MQTT_INGESTOR_PASSWORD in .env}
+      MQTT_CA_FILE: /certs/ca.crt
+      POSTGRES_HOST: timescaledb
+      POSTGRES_DB: ${POSTGRES_DB:-factorysense}
+      POSTGRES_USER: ${POSTGRES_USER:-factorysense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./config/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - mqtt-tls-ca:/certs:ro
+    networks: [cloud_net]
+    depends_on:
+      mosquitto: { condition: service_healthy }
+      timescaledb: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # why this exists: the single database. PostgreSQL for referential integrity (assets, users, alerts,
+  # work orders) plus the TimescaleDB extension for telemetry: a hypertable for fast time-range appends,
+  # an hourly continuous aggregate for trends, and retention policies. One engine, one query language.
+  timescaledb:
+    image: timescale/timescaledb:2.30.1-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-factorysense}
+      POSTGRES_USER: ${POSTGRES_USER:-factorysense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      TELEMETRY_RETENTION: ${TELEMETRY_RETENTION:-30 days}
+      TELEMETRY_1H_RETENTION: ${TELEMETRY_1H_RETENTION:-365 days}
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      # Mounted file by file: the image ships its own init scripts in the same directory.
+      - ./config/timescaledb/init/010-telemetry.sh:/docker-entrypoint-initdb.d/010-telemetry.sh:ro
+      - ./config/timescaledb/init/020-app-schema.sql:/docker-entrypoint-initdb.d/020-app-schema.sql:ro
+    networks: [cloud_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # why this exists: owns the whole alert lifecycle in one container, as two logical parts.
+  # Rules: is this reading anomalous? (thresholds, adaptive baseline from a sliding window in the DB).
+  # Alerts: what do we do about it? (dedupe, severity, escalation), for equipment alerts and Suricata
+  # alerts alike, stored with a `source` field (equipment | ids). Holds no local state.
+  rules-engine:
+    build: ./services/rules-engine
+    init: true
+    environment:
+      SERVICE_NAME: rules-engine
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 8883
+      MQTT_USER: rules-engine
+      MQTT_PASSWORD: ${MQTT_RULES_PASSWORD:?set MQTT_RULES_PASSWORD in .env}
+      MQTT_CA_FILE: /certs/ca.crt
+      POSTGRES_HOST: timescaledb
+      POSTGRES_DB: ${POSTGRES_DB:-factorysense}
+      POSTGRES_USER: ${POSTGRES_USER:-factorysense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      IDS_EVE_PATH: /var/log/suricata/eve.json
+    volumes:
+      - mqtt-tls-ca:/certs:ro
+      - ids-logs:/var/log/suricata:ro
+    networks: [cloud_net]
+    depends_on:
+      mosquitto: { condition: service_healthy }
+      timescaledb: { condition: service_healthy }
+    healthcheck: *stub-healthcheck
+    restart: unless-stopped
+
+  # why this exists: REST + WebSocket query layer for the dashboard. Stateless, no host port and
+  # no container_name, so `docker compose up -d --scale api=3` works and Traefik load-balances it.
+  api:
+    build: ./services/api
+    environment:
+      SERVICE_NAME: api
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POSTGRES_HOST: timescaledb
+      POSTGRES_DB: ${POSTGRES_DB:-factorysense}
+      POSTGRES_USER: ${POSTGRES_USER:-factorysense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    networks: [cloud_net]
+    depends_on:
+      timescaledb: { condition: service_healthy }
+    healthcheck: *stub-healthcheck
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.api.rule: PathPrefix(`/api`)
+      traefik.http.routers.api.entrypoints: web
+      traefik.http.routers.api.middlewares: api-strip@file,security-headers@file
+      traefik.http.services.api.loadbalancer.server.port: "8000"
+      traefik.http.services.api.loadbalancer.healthcheck.path: /health
+    restart: unless-stopped
+
+  # why this exists: custom dashboard (static HTML/JS) that talks to the API through the proxy.
+  frontend:
+    build: ./services/frontend
+    networks: [cloud_net]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.frontend.rule: PathPrefix(`/`)
+      traefik.http.routers.frontend.entrypoints: web
+      traefik.http.routers.frontend.middlewares: security-headers@file
+      traefik.http.services.frontend.loadbalancer.server.port: "8080"
+    restart: unless-stopped
+
+  # why this exists: single public entry point. Discovers every api replica through the Docker
+  # provider, which is what makes the --scale demo meaningful (demo 3).
+  proxy:
+    image: traefik:v3.7
+    ports:
+      - "${PROXY_HTTP_PORT:-80}:80"
+    volumes:
+      # Read-only socket so Traefik can discover replicas. See README "Limits" for the trade-off.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./config/traefik/dynamic:/etc/traefik/dynamic:ro
+    networks: [cloud_net]
+    depends_on:
+      api: { condition: service_healthy }
+      frontend: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  # OT network. `internal` removes the default route: nothing here can reach the cloud or the internet.
+  # Fixed subnets so Suricata rules can name each side of the boundary.
+  plant_net:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24
+  cloud_net:
+    ipam:
+      config:
+        - subnet: 172.28.20.0/24
+
+volumes:
+  timescaledb-data:
+  mosquitto-data:
+  gateway-buffer:
+  ids-logs:
+  # Split on purpose: clients only get the CA certificate, never the broker's private key.
+  mqtt-tls-server:
+  mqtt-tls-ca:

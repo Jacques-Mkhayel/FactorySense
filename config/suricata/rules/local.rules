@@ -1,0 +1,12 @@
+# FactorySense local rules. SIDs 1000000-1999999 are reserved for local use.
+
+# Sanity rule: proves the sensor sees the boundary. Nothing in the architecture pings the gateway,
+# so an ICMP echo towards it from the plant floor means an unexpected device is probing.
+alert icmp $PLANT_NET any -> any any (msg:"FACTORYSENSE ICMP echo request from plant floor"; itype:8; classtype:attempted-recon; sid:1000001; rev:1;)
+
+# The PLC is read-only by design: the gateway only reads input registers. A Modbus write seen
+# on the gateway's interfaces means the gateway is compromised and being used to tamper with the machine.
+alert modbus any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE Modbus write attempt on read-only PLC"; modbus: access write; classtype:attempted-admin; sid:1000002; rev:1;)
+
+# TODO(phase 2): port scan against the gateway, unexpected protocols on the plant floor,
+# plaintext (non-TLS) traffic towards the broker.
