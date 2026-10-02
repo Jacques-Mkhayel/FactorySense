@@ -25,6 +25,7 @@ services:
       SERVICE_NAME: simulator
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       MACHINE_ID: ${MACHINE_ID:-press-01}
+      SIMULATION_SCENARIO: ${SIMULATION_SCENARIO:-normal}
       MODBUS_PORT: 502
     networks: [plant_net]
     healthcheck: *stub-healthcheck
@@ -40,6 +41,7 @@ services:
       SERVICE_NAME: edge-gateway
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SITE_ID: ${SITE_ID:-plant-01}
+      MACHINE_ID: ${MACHINE_ID:-press-01}
       MODBUS_HOST: simulator
       MODBUS_PORT: 502
       MODBUS_UNIT_ID: 1
@@ -51,6 +53,10 @@ services:
       MQTT_CA_FILE: /certs/ca.crt
       BUFFER_PATH: /var/lib/gateway/buffer.db
       BUFFER_RETENTION_H: ${GATEWAY_BUFFER_RETENTION_H:-72}
+      MQTT_ACK_TIMEOUT_S: ${MQTT_ACK_TIMEOUT_S:-30}
+      LOCAL_WINDOW_S: ${LOCAL_WINDOW_S:-60}
+      LOCAL_TEMP_CRITICAL_C: ${LOCAL_TEMP_CRITICAL_C:-85}
+      LOCAL_TEMP_CLEAR_C: ${LOCAL_TEMP_CLEAR_C:-80}
     volumes:
       - gateway-buffer:/var/lib/gateway
       - mqtt-tls-ca:/certs:ro
@@ -127,7 +133,7 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # why this exists: MQTT -> TimescaleDB ingestion as pure configuration (Telegraf), not custom code.
+  # why this exists: MQTT -> validation -> TimescaleDB, using Telegraf and an in-process Starlark script.
   ingestor:
     image: telegraf:1.40-alpine
     environment:
@@ -136,12 +142,13 @@ services:
       MQTT_USER: ingestor
       MQTT_PASSWORD: ${MQTT_INGESTOR_PASSWORD:?set MQTT_INGESTOR_PASSWORD in .env}
       MQTT_CA_FILE: /certs/ca.crt
-      POSTGRES_HOST: timescaledb
-      POSTGRES_DB: ${POSTGRES_DB:-factorysense}
-      POSTGRES_USER: ${POSTGRES_USER:-factorysense}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGHOST: timescaledb
+      PGDATABASE: ${POSTGRES_DB:-factorysense}
+      PGUSER: ${POSTGRES_USER:-factorysense}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - ./config/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - ./config/telegraf/telemetry.star:/etc/telegraf/telemetry.star:ro
       - mqtt-tls-ca:/certs:ro
     networks: [cloud_net]
     depends_on:

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs once, on the first start with an empty timescaledb-data volume.
 # Telemetry storage only: this table is the payload contract with Telegraf (tags -> text columns,
-# fields -> double precision columns). Telegraf adds any new field as a column on its own.
+# fields -> double precision columns). Telegraf validates and writes only this fixed schema.
 set -eu
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
