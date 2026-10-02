@@ -50,8 +50,10 @@ alert udp $PLANT_NET any -> any 53 (msg:"FACTORYSENSE ALERT: Rogue device DNS qu
 # Scoped to cloud_net to avoid false positives from unrelated dev tooling.
 alert tcp $CLOUD_NET any -> any 1883 (msg:"FACTORYSENSE ALERT: Plaintext MQTT connection attempt (TLS required) [Data Leak]"; flow:to_server; classtype:policy-violation; priority:1; sid:1000006; rev:2;)
 
-# 3.2 Direct outbound traffic from plant floor towards Internet
-alert ip $PLANT_NET any -> $EXTERNAL_NET any (msg:"FACTORYSENSE ALERT: Plant floor egress attempt to external network"; classtype:policy-violation; priority:1; sid:1000007; rev:1;)
+# 3.2 Direct outbound traffic from plant floor towards Internet.
+# Multicast and broadcast are link-local, not egress: the Docker host's bridge (.1) sends mDNS to
+# 224.0.0.251 on its own, which raised a critical false positive with plain $EXTERNAL_NET.
+alert ip $PLANT_NET any -> ![$HOME_NET,224.0.0.0/4,255.255.255.255] any (msg:"FACTORYSENSE ALERT: Plant floor egress attempt to external network"; classtype:policy-violation; priority:1; sid:1000007; rev:2;)
 
 # ------------------------------------------------------------------------------
 # 4. SERVICE UNAVAILABILITY: DENIAL OF SERVICE (DoS)

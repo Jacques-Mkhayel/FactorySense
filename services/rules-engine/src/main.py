@@ -20,7 +20,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_USER = os.getenv("MQTT_USER", "rules-engine")
-MQTT_PASSWORD = os.getenv("MQTT_RULES_PASSWORD", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 MQTT_CA_FILE = os.getenv("MQTT_CA_FILE", "/certs/ca.crt")
 
 # Database Configuration
@@ -49,7 +49,6 @@ THRESHOLDS = {
     },
 }
 SENSOR_TIMEOUT_S = float(os.getenv("SENSOR_TIMEOUT_S", "10.0"))
-DEDUPE_WINDOW_S = float(os.getenv("DEDUPE_WINDOW_S", "30.0"))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -100,71 +99,49 @@ def init_db_pool():
             log.warning("Database not ready yet (%s). Retrying in 3s...", e)
             time.sleep(3)
 
-    # Ensure alerts table exists
+    # The schema belongs to config/timescaledb/init/020-app-schema.sql; fail loudly if it is missing
+    # (a timescaledb-data volume created before that file existed) instead of creating it here.
     conn = db_pool.getconn()
     try:
-        conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS alerts (
-                    id          BIGSERIAL PRIMARY KEY,
-                    time        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    source      TEXT NOT NULL CHECK (source IN ('equipment', 'ids')),
-                    site_id     TEXT,
-                    machine_id  TEXT,
-                    rule_name   TEXT NOT NULL,
-                    severity    TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
-                    status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'acknowledged', 'resolved')),
-                    details     JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    dedupe_key  TEXT,
-                    count       INTEGER NOT NULL DEFAULT 1,
-                    last_seen   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts (source);
-                CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts (status);
-                CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts (time DESC);
-                CREATE INDEX IF NOT EXISTS idx_alerts_dedupe ON alerts (dedupe_key, status) WHERE status = 'active';
-            """)
-        log.info("Alerts table ready in database")
+            cur.execute("SELECT to_regclass('public.alerts')")
+            if cur.fetchone()[0] is None:
+                log.error("Table 'alerts' is missing: the DB volume predates 020-app-schema.sql. "
+                          "Reset it with `docker compose down -v` or run that file with psql.")
+            else:
+                log.info("Alerts table found in database")
+        conn.rollback()
     finally:
         db_pool.putconn(conn)
 
 
 def save_or_dedupe_alert(source: str, site_id: str | None, machine_id: str | None,
                          rule_name: str, severity: str, details: dict, dedupe_key: str):
-    """Upsert alert: increment count if active within dedupe window, else insert new alert."""
+    """Opens an alert, or bumps the active one with the same key. One atomic statement, so the
+    MQTT, IDS and watchdog threads cannot race into duplicate active alerts."""
     conn = None
     try:
         conn = db_pool.getconn()
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE alerts
-                SET count = count + 1,
-                    last_seen = NOW(),
-                    severity = %s,
-                    rule_name = %s,
-                    details = %s
-                WHERE dedupe_key = %s
-                  AND status = 'active'
-                  AND last_seen >= NOW() - (%s * INTERVAL '1 second')
+                INSERT INTO alerts (source, site_id, machine_id, rule_name, severity, details, dedupe_key)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (dedupe_key) WHERE status = 'active' DO UPDATE
+                SET count = alerts.count + 1,
+                    last_seen = now(),
+                    severity = EXCLUDED.severity,
+                    rule_name = EXCLUDED.rule_name,
+                    details = EXCLUDED.details
                 RETURNING id, count;
-            """, (severity, rule_name, Json(details), dedupe_key, DEDUPE_WINDOW_S))
-            row = cur.fetchone()
-
-            if row:
-                alert_id, count = row
-                log.info("Updated active alert [%s] id=%d count=%d rule='%s' severity=%s",
-                         source, alert_id, count, rule_name, severity)
-            else:
-                cur.execute("""
-                    INSERT INTO alerts (time, source, site_id, machine_id, rule_name, severity, status, details, dedupe_key, count, last_seen)
-                    VALUES (NOW(), %s, %s, %s, %s, %s, 'active', %s, %s, 1, NOW())
-                    RETURNING id;
-                """, (source, site_id, machine_id, rule_name, severity, Json(details), dedupe_key))
-                alert_id = cur.fetchone()[0]
+            """, (source, site_id, machine_id, rule_name, severity, Json(details), dedupe_key))
+            alert_id, count = cur.fetchone()
+            if count == 1:
                 log.warning("NEW ALERT [%s] id=%d severity=%s rule='%s' site=%s machine=%s",
                             source, alert_id, severity, rule_name, site_id, machine_id)
+            else:
+                log.info("Updated active alert [%s] id=%d count=%d rule='%s' severity=%s",
+                         source, alert_id, count, rule_name, severity)
     except Exception as e:
         log.error("Failed to save alert: %s", e)
     finally:
@@ -181,7 +158,7 @@ def resolve_alert(dedupe_key: str):
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE alerts
-                SET status = 'resolved', last_seen = NOW()
+                SET status = 'resolved', resolved_at = now()
                 WHERE dedupe_key = %s AND status = 'active'
                 RETURNING id, rule_name;
             """, (dedupe_key,))
@@ -279,20 +256,37 @@ def on_mqtt_connect(client, _userdata, _flags, rc, _properties=None):
         log.info("Connected to MQTT broker (Mosquitto TLS). Subscribing...")
         client.subscribe("factorysense/telemetry/#", qos=1)
     else:
-        log.error("MQTT connection failed with code %d", rc)
+        # paho 2 passes a ReasonCode object, not an int
+        log.error("MQTT connection failed: %s", rc)
+
+
+def _reading(payload: dict, field: str) -> float | None:
+    """Returns the field only if it is a real number. An exception here would escape paho's loop
+    and drop the MQTT connection, so a single malformed message must never reach a comparison."""
+    value = payload.get(field)
+    # bool is a subclass of int: a spoofed `true` must not pass as a reading
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if value is not None:
+        log.warning("Ignoring non-numeric %s=%r", field, value)
+    return None
 
 
 def on_mqtt_message(_client, _userdata, msg):
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
-    except Exception:
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        log.warning("Ignoring non-JSON message on %s", msg.topic)
+        return
+    if not isinstance(payload, dict):
+        log.warning("Ignoring non-object JSON on %s", msg.topic)
         return
 
-    site_id = payload.get("site_id", "unknown")
-    machine_id = payload.get("machine_id", "unknown")
-    temp = payload.get("temperature")
-    vib = payload.get("vibration")
-    press = payload.get("pressure")
+    site_id = str(payload.get("site_id", "unknown"))
+    machine_id = str(payload.get("machine_id", "unknown"))
+    temp = _reading(payload, "temperature")
+    vib = _reading(payload, "vibration")
+    press = _reading(payload, "pressure")
 
     with lock:
         last_seen_machines[machine_id] = {
@@ -389,7 +383,8 @@ def watchdog_worker():
 # Main Application Entrypoint
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # 1. Start HTTP healthcheck server for Docker (bind to 0.0.0.0)
+    # 1. Health endpoint on all interfaces so other cloud_net services can probe it, not only the
+    #    container-local healthcheck. Safe here: rules-engine lives on cloud_net only, never on the gateway.
     threading.Thread(
         target=ThreadingHTTPServer(("0.0.0.0", PORT), Health).serve_forever,
         daemon=True
