@@ -3,12 +3,34 @@
 # The CA private key is never persisted, so nothing can mint further certificates.
 # To rotate: `docker compose down`, remove the mqtt-tls-* volumes, start again.
 set -eu
+umask 077
+: "${MQTT_TLS_HOSTNAME:?MQTT_TLS_HOSTNAME must be non-empty}"
+# This prototype issues a single DNS-name certificate, not IP or wildcard certificates.
+case "$MQTT_TLS_HOSTNAME" in
+    *[!a-zA-Z0-9.-]*|.*|-*) echo "Invalid MQTT_TLS_HOSTNAME" >&2; exit 1 ;;
+esac
 
 SERVER_DIR=/tls/server
 CA_DIR=/tls/ca
 
-if [ -s "$SERVER_DIR/server.crt" ] && [ -s "$CA_DIR/ca.crt" ]; then
-    echo "TLS material already present for ${MQTT_TLS_HOSTNAME}, nothing to do"
+# Never silently replace only half of an existing certificate set: clients may still
+# trust the old CA. Fail clearly so the operator can repair/rotate the set together.
+if [ -e "$SERVER_DIR/server.crt" ] || [ -e "$SERVER_DIR/server.key" ] || [ -e "$CA_DIR/ca.crt" ]; then
+    for file in "$SERVER_DIR/server.crt" "$SERVER_DIR/server.key" "$CA_DIR/ca.crt"; do
+        if [ ! -s "$file" ]; then
+            echo "Incomplete TLS material: missing or empty $file. Restore or rotate the complete TLS set." >&2
+            exit 1
+        fi
+    done
+    openssl verify -CAfile "$CA_DIR/ca.crt" -purpose sslserver \
+        -verify_hostname "$MQTT_TLS_HOSTNAME" "$SERVER_DIR/server.crt"
+    CERT_PUBLIC=$(openssl x509 -in "$SERVER_DIR/server.crt" -pubkey -noout)
+    KEY_PUBLIC=$(openssl pkey -in "$SERVER_DIR/server.key" -pubout)
+    if [ "$CERT_PUBLIC" != "$KEY_PUBLIC" ]; then
+        echo "TLS private key does not match the server certificate." >&2
+        exit 1
+    fi
+    echo "Validated existing TLS material for ${MQTT_TLS_HOSTNAME}"
     exit 0
 fi
 

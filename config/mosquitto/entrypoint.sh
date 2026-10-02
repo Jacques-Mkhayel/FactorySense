@@ -5,9 +5,17 @@
 # these files owned by it and not world-readable.
 set -eu
 
+# Fail before creating any files if a required credential is absent or empty.
+: "${MQTT_GATEWAY_PASSWORD:?MQTT_GATEWAY_PASSWORD must be non-empty}"
+: "${MQTT_INGESTOR_PASSWORD:?MQTT_INGESTOR_PASSWORD must be non-empty}"
+: "${MQTT_RULES_PASSWORD:?MQTT_RULES_PASSWORD must be non-empty}"
+# Copies of private keys and password hashes must be private from creation.
+umask 077
+
 RUNTIME_DIR=/tmp/mosquitto
 PASSWD_FILE="$RUNTIME_DIR/passwd"
 mkdir -p "$RUNTIME_DIR"
+chmod 0700 "$RUNTIME_DIR"
 cp /mosquitto/config/acl "$RUNTIME_DIR/acl"
 cp /mosquitto/tls/server.key "$RUNTIME_DIR/server.key"
 : > "$PASSWD_FILE"
