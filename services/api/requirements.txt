@@ -1,2 +1,6 @@
 fastapi==0.141.1
 uvicorn==0.53.0
+# uvicorn needs a WebSocket implementation to serve /ws/alerts
+websockets==17.1
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3

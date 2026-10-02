@@ -2,10 +2,22 @@
 
 # aliasHeadersStrategy: drop headers like X_Forwarded_For that backends would read as X-Forwarded-For.
 entryPoints:
+  # Plain HTTP only redirects: the login form and the session cookie never travel unencrypted.
   web:
     address: ":80"
     http:
       aliasHeadersStrategy: delete
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  # TLS with Traefik's own self-signed default certificate: no key in the repo and no real CA,
+  # at the price of a browser warning (see README "Limits").
+  websecure:
+    address: ":443"
+    http:
+      aliasHeadersStrategy: delete
+      tls: {}
   # Internal only (not published): serves the ping endpoint used by the healthcheck.
   traefik:
     address: ":8080"

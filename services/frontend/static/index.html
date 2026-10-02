@@ -3,15 +3,96 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FactorySense</title>
+  <title>FactorySense SOC</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header><h1>FactorySense</h1><p>Phase 1 skeleton</p></header>
-  <main>
-    <p>API status: <strong id="api-status">checking…</strong></p>
-    <!-- TODO(phase 2): live telemetry, alerts (equipment + ids), historical trends. -->
-  </main>
+  <!-- No inline script or style anywhere: the proxy's CSP only allows files from this origin. -->
+  <section id="login-view" class="login" hidden>
+    <form id="login-form" class="card login-card">
+      <div class="brand"><span class="logo">◆</span>FactorySense</div>
+      <p class="muted">Equipment &amp; security operations</p>
+      <label>Username <input name="username" autocomplete="username" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand"><span class="logo">◆</span>FactorySense <span class="muted">SOC</span></div>
+      <nav id="tabs">
+        <button data-tab="alerts" class="active">Alerts</button>
+        <button data-tab="telemetry">Telemetry</button>
+        <button data-tab="users" class="admin-only">Users</button>
+      </nav>
+      <div class="status">
+        <span id="live" class="pill off" title="Live alert stream">● offline</span>
+        <span id="replica" class="pill" title="API replica that answered last">replica –</span>
+        <span id="whoami" class="muted"></span>
+        <button id="logout" class="ghost">Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="tab-alerts">
+        <div class="kpis">
+          <div class="kpi critical"><span id="k-critical">0</span>Critical</div>
+          <div class="kpi warning"><span id="k-warning">0</span>Warning</div>
+          <div class="kpi info"><span id="k-info">0</span>Info</div>
+          <div class="kpi"><span id="k-ids">0</span>Open IDS</div>
+          <div class="kpi"><span id="k-equipment">0</span>Open equipment</div>
+          <div class="kpi"><span id="k-acknowledged">0</span>Acknowledged</div>
+          <div class="kpi"><span id="k-resolved_24h">0</span>Resolved 24 h</div>
+        </div>
+        <div class="card">
+          <div class="toolbar">
+            <h2>Alert feed</h2>
+            <select id="f-source"><option value="">All sources</option><option>equipment</option><option>ids</option></select>
+            <select id="f-severity"><option value="">All severities</option><option>critical</option><option>warning</option><option>info</option></select>
+            <select id="f-status"><option value="">Open &amp; closed</option><option selected>active</option><option>acknowledged</option><option>resolved</option></select>
+          </div>
+          <table class="grid">
+            <thead><tr><th>Severity</th><th>Source</th><th>Rule</th><th>Asset</th><th>Count</th><th>First seen</th><th>Last seen</th><th>Status</th><th></th></tr></thead>
+            <tbody id="alerts"></tbody>
+          </table>
+          <p id="alerts-empty" class="muted empty" hidden>No alerts match these filters.</p>
+        </div>
+      </section>
+
+      <section id="tab-telemetry" hidden>
+        <div class="card toolbar">
+          <h2>Telemetry</h2>
+          <select id="machine"></select>
+          <select id="range"><option value="1">Last hour</option><option value="6">6 hours</option><option value="24">24 hours</option><option value="168">7 days</option></select>
+          <span id="telemetry-note" class="muted"></span>
+        </div>
+        <div class="charts">
+          <div class="card chart"><h3>Temperature <small>°C</small><b id="v-temperature"></b></h3><canvas data-metric="temperature"></canvas></div>
+          <div class="card chart"><h3>Vibration <small>mm/s</small><b id="v-vibration"></b></h3><canvas data-metric="vibration"></canvas></div>
+          <div class="card chart"><h3>Pressure <small>bar</small><b id="v-pressure"></b></h3><canvas data-metric="pressure"></canvas></div>
+        </div>
+      </section>
+
+      <section id="tab-users" hidden>
+        <form id="user-form" class="card toolbar">
+          <h2>New user</h2>
+          <input name="username" placeholder="username" pattern="[a-z0-9._\-]{3,32}" required>
+          <input name="password" type="password" placeholder="password (10+ chars)" minlength="10" required autocomplete="new-password">
+          <select name="role"><option>analyst</option><option>admin</option></select>
+          <button type="submit">Create</button>
+          <span id="user-msg" class="muted"></span>
+        </form>
+        <div class="card">
+          <table class="grid">
+            <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Created</th><th>Last login</th><th></th></tr></thead>
+            <tbody id="users"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>
