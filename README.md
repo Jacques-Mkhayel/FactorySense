@@ -301,11 +301,14 @@ its original timestamp, source IDs, `rule=overheating`, `state=active|resolved`,
 temperature, thresholds and recent features. Alert state and queued events survive outages
 and restarts. Status events use the same retention policy as telemetry.
 
-Telegraf subscribes to telemetry only. The broker now permits the rules-engine account to
-read status events, but its application still needs to subscribe and process them: **these local
-status events are not yet stored as cloud alerts or displayed by the dashboard**. Cloud
-alert processing remains separate work. The raw temperature still reaches telemetry so
-future cloud rules can detect overheating independently.
+Telegraf subscribes to telemetry only. The rules-engine subscribes to both topics: each
+`active` status event opens an **"Edge local alarm: overheating"** alert in the dashboard (source
+`equipment`, `details.origin = edge-gateway`, with the original measurement time) and the matching
+`resolved` event closes it. Because the decision is taken at the edge, the alarm is raised even
+during a WAN outage and reaches the dashboard when the gateway replays its buffer. Like Telegraf,
+the rules-engine keeps a persistent MQTT session, so the broker queues that replay (up to its
+default 1000 messages) even if the gateway reconnects before the rules-engine does. The raw
+temperature still reaches telemetry, so the cloud rules detect overheating independently too.
 
 ## Running and verifying the gateway
 
@@ -625,8 +628,9 @@ docker compose start mosquitto
    keeps its original time when it is sent later.
 3. `ingestor` writes each reading into the `telemetry` hypertable. TimescaleDB rolls it up hourly
    into `telemetry_1h` and drops raw data after 30 days (rollups after 365).
-4. `rules-engine` evaluates the same stream, plus Suricata's `eve.json`, and stores alerts with a
-   `source` of `equipment` or `ids`.
+4. `rules-engine` evaluates the same stream, the gateway's own alarm transitions
+   (`factorysense/status/...`) and Suricata's `eve.json`, and stores alerts with a `source` of
+   `equipment` or `ids`. Its thresholds are calibrated against the simulator's normal profile.
 5. A database trigger `NOTIFY`s every alert change; each `api` replica `LISTEN`s and pushes it to
    its dashboards over a WebSocket, so the alert feed is live without polling.
 6. `proxy` terminates TLS and exposes the API at `/api` and the dashboard at `/`. Analysts can

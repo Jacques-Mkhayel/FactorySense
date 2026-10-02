@@ -5,6 +5,7 @@ import os
 import ssl
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import paho.mqtt.client as mqtt
@@ -33,7 +34,9 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 # IDS eve.json path
 IDS_EVE_PATH = os.getenv("IDS_EVE_PATH", "/var/log/suricata/eve.json")
 
-# Calibrated Thresholds
+# Calibrated against the simulator's normal profile (services/simulator, README "Simulator measurement
+# generation"): temperature 67.8-72.2 C, pressure 4.03-4.37 bar, vibration 0.68-0.92 mm/s. Every normal
+# reading stays clear of every threshold; TEMP_CRIT matches the gateway's LOCAL_TEMP_CRITICAL_C (85 C).
 THRESHOLDS = {
     "temperature": {
         "warning": float(os.getenv("TEMP_WARN_THRESHOLD", "75.0")),
@@ -44,8 +47,9 @@ THRESHOLDS = {
         "critical": float(os.getenv("VIB_CRIT_THRESHOLD", "6.0")),
     },
     "pressure": {
-        "min_critical": float(os.getenv("PRESS_MIN_CRIT", "4.0")),
-        "max_critical": float(os.getenv("PRESS_MAX_CRIT", "8.0")),
+        # Centred on the 4.2 bar operating point, about 4x the normal swing away on each side.
+        "min_critical": float(os.getenv("PRESS_MIN_CRIT", "3.5")),
+        "max_critical": float(os.getenv("PRESS_MAX_CRIT", "5.0")),
     },
 }
 SENSOR_TIMEOUT_S = float(os.getenv("SENSOR_TIMEOUT_S", "10.0"))
@@ -229,7 +233,8 @@ def ids_worker():
 def on_mqtt_connect(client, _userdata, _flags, rc, _properties=None):
     if rc == 0:
         log.info("Connected to MQTT broker (Mosquitto TLS). Subscribing...")
-        client.subscribe("factorysense/telemetry/#", qos=1)
+        # Raw readings for the cloud rules, and the gateway's own alarm transitions.
+        client.subscribe([("factorysense/telemetry/#", 1), ("factorysense/status/#", 1)])
     else:
         # paho 2 passes a ReasonCode object, not an int
         log.error("MQTT connection failed: %s", rc)
@@ -247,6 +252,35 @@ def _reading(payload: dict, field: str) -> float | None:
     return None
 
 
+def handle_edge_event(payload: dict):
+    """Alarm transitions raised by the gateway itself (factorysense/status/...). They are decided at
+    the edge, so they keep working through a WAN outage and arrive later with their original `ts`."""
+    state = payload.get("state")
+    if payload.get("kind") != "local_alert" or state not in ("active", "resolved"):
+        log.warning("Ignoring status event kind=%r state=%r", payload.get("kind"), state)
+        return
+    site_id = str(payload.get("site_id", "unknown"))
+    machine_id = str(payload.get("machine_id", "unknown"))
+    rule = str(payload.get("rule", "unknown"))[:64]
+    dedupe_key = f"edge:{site_id}:{machine_id}:{rule}"
+    if state == "resolved":
+        resolve_alert(dedupe_key)
+        return
+    ts = payload.get("ts")
+    measured_at = (datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat()
+                   if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None)
+    severity = payload.get("severity")
+    details = {
+        "origin": "edge-gateway", "rule": rule, "measured_at": measured_at,
+        "temperature": _reading(payload, "temperature"),
+        "critical_c": _reading(payload, "critical_c"), "clear_c": _reading(payload, "clear_c"),
+        "features": payload.get("features") if isinstance(payload.get("features"), dict) else None,
+    }
+    save_or_dedupe_alert("equipment", site_id, machine_id, f"Edge local alarm: {rule}",
+                         severity if severity in ("info", "warning", "critical") else "critical",
+                         details, dedupe_key)
+
+
 def on_mqtt_message(_client, _userdata, msg):
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
@@ -255,6 +289,9 @@ def on_mqtt_message(_client, _userdata, msg):
         return
     if not isinstance(payload, dict):
         log.warning("Ignoring non-object JSON on %s", msg.topic)
+        return
+    if msg.topic.startswith("factorysense/status/"):
+        handle_edge_event(payload)
         return
 
     site_id = str(payload.get("site_id", "unknown"))
@@ -312,7 +349,10 @@ def mqtt_worker():
         log.info("Waiting for CA certificate at %s...", MQTT_CA_FILE)
         time.sleep(2)
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rules-engine")
+    # Persistent session (like Telegraf's): the broker queues QoS 1 messages while this client is away.
+    # After a WAN outage the gateway replays its buffer within a second or two of reconnecting, often
+    # before this client is back; a clean session would silently lose that backfill and edge alarms.
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rules-engine", clean_session=False)
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     client.tls_set(ca_certs=MQTT_CA_FILE, tls_version=ssl.PROTOCOL_TLS_CLIENT)
     client.on_connect = on_mqtt_connect
