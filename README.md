@@ -4,9 +4,9 @@ Industrial IoT monitoring prototype: machines on a plant floor stream vibration,
 pressure to a public cloud, which stores the telemetry, raises alerts and serves a dashboard.
 Built with Docker Compose as a hybrid edge/cloud architecture.
 
-> **Status: Phase 1 (skeleton).** Every service starts, stays healthy and is wired to the others.
-> Business logic in the custom services (simulation, features, rules, API endpoints, dashboard)
-> is still `TODO`, so no telemetry flows on its own yet.
+> **Status: Phase 2 (implementation).** Done: rules-engine, IDS rules, API, dashboard, proxy
+> security layer and database schema. In progress: `edge-gateway` and `simulator`, so until they
+> land, telemetry only flows when you publish it by hand (see "Try it").
 
 ## Architecture
 
@@ -25,16 +25,16 @@ or the internet); `edge-gateway` is the only container on both networks, and it 
 | `ingestor` | MQTT to database, configuration only | Telegraf |
 | `timescaledb` | Single database: telemetry hypertable + hourly rollup, and relational data | PostgreSQL + TimescaleDB |
 | `rules-engine` | Detects anomalies and manages alerts (equipment and IDS) | Python |
-| `api` | REST + WebSocket query layer, horizontally scalable | FastAPI |
-| `frontend` | Dashboard | Static HTML/JS on nginx |
-| `proxy` | Single public entry point, load-balances `api` replicas | Traefik |
+| `api` | Login, alerts, telemetry and user management (REST) + live alerts (WebSocket); stateless, horizontally scalable | FastAPI, psycopg 3 |
+| `frontend` | Mini SIEM dashboard: alert feed, KPIs, telemetry charts, user admin | Static HTML/CSS/JS on nginx |
+| `proxy` | Single public entry point and security layer (TLS, CSP, rate limits); load-balances `api` replicas | Traefik |
 
 `mqtt-certs` is a one-shot job, not a service: it creates the broker's TLS certificate on first
 start and exits with code 0.
 
 ## Quick start
 
-Requirements: Docker with Compose v2, and port 80 free (or set `PROXY_HTTP_PORT` in `.env`).
+Requirements: Docker with Compose v2, and ports 80 and 443 free (see Troubleshooting otherwise).
 
 ```bash
 cp .env.example .env          # then replace the change-me values
@@ -42,8 +42,9 @@ docker compose up -d --build --wait
 docker compose ps             # 10 services "healthy", mqtt-certs "Exited (0)"
 ```
 
-Open http://localhost: the dashboard should show **API status: ok**.
-API docs: http://localhost/api/docs.
+Open https://localhost and accept the self-signed certificate warning (http:// redirects there).
+Sign in with `ADMIN_USERNAME` / `ADMIN_PASSWORD` from `.env`; create more users in the **Users** tab.
+API docs: https://localhost/api/docs.
 
 Stop with `docker compose down` (keeps data) or `docker compose down -v` (full reset, also
 regenerates certificates and re-runs database init).
@@ -75,13 +76,15 @@ docker compose exec simulator python -c "import socket; socket.create_connection
 ```bash
 docker compose up -d --scale api=3 --wait
 sleep 5   # give Traefik time to register the new replicas
-for i in $(seq 9); do curl -s http://localhost/api/health > /dev/null; done
-docker compose logs --since 30s proxy | grep -o 'http://[0-9.]*:8000' | sort | uniq -c
+for i in $(seq 9); do curl -sk https://localhost/api/health; echo; done   # "replica" changes
 docker compose up -d --scale api=1
 ```
 
+The dashboard shows the replica that answered last in the top bar (sessions live in the database,
+so you stay signed in whichever replica answers).
+
 **Intrusion detection**: a rogue device pings the gateway, then the gateway writes to the
-read-only PLC. Both raise Suricata alerts.
+read-only PLC. Both raise Suricata alerts, which appear live in the dashboard with source `ids`.
 
 ```bash
 docker run --rm --network factorysense_plant_net alpine:3.24 ping -c 2 edge-gateway
@@ -107,7 +110,18 @@ docker compose start mosquitto
    into `telemetry_1h` and drops raw data after 30 days (rollups after 365).
 4. `rules-engine` evaluates the same stream, plus Suricata's `eve.json`, and stores alerts with a
    `source` of `equipment` or `ids`.
-5. `api` reads the database; `proxy` exposes it at `/api` and the dashboard at `/`.
+5. A database trigger `NOTIFY`s every alert change; each `api` replica `LISTEN`s and pushes it to
+   its dashboards over a WebSocket, so the alert feed is live without polling.
+6. `proxy` terminates TLS and exposes the API at `/api` and the dashboard at `/`. Analysts can
+   acknowledge or resolve alerts; an acknowledged alert stays open, keeps counting repeats and
+   still auto-resolves when the reading returns to normal.
+
+**Security layers**, outside in: HTTPS only (HTTP redirects); security headers and a strict CSP
+on the dashboard; per-IP rate limits (5 logins per minute), body-size and concurrency caps at the
+proxy; scrypt password hashes and server-side sessions in an `HttpOnly`, `Secure`,
+`SameSite=Strict` cookie (logout and account deactivation take effect at once); admin-only user
+management with no public sign-up; and a least-privilege `api` database role that can read
+telemetry and alerts but only change an alert's workflow columns.
 
 Configuration lives in `.env` (see comments in [`.env.example`](.env.example)).
 No secrets or certificates are committed.
@@ -120,7 +134,7 @@ services/              custom code: simulator, edge-gateway, rules-engine, api, 
 config/                configuration of the off-the-shelf components
   mosquitto/           broker config, ACL, user and certificate bootstrap
   telegraf/            MQTT -> database pipeline
-  timescaledb/init/    telemetry hypertable, rollup, retention; app schema (TODO)
+  timescaledb/init/    telemetry hypertable, rollup, retention; alerts; users, sessions, api role
   suricata/            IDS config and local rules
   traefik/             proxy config and shared middlewares
 docs/architecture.mmd  architecture diagram
@@ -129,10 +143,17 @@ docs/architecture.mmd  architecture diagram
 ## Limits
 
 - **Prototype, not production.** Single host, one broker, one database: no high availability.
-- **Phase 1 stubs.** The custom services only log, report health and wait at a `TODO`.
-- **Security shortcuts.** The TLS CA is self-signed and throwaway; services use the database
-  owner account; only MQTT is encrypted (HTTP and database traffic inside `cloud_net` are not);
-  Traefik mounts the Docker socket read-only to discover replicas, which is root-equivalent access.
+- **Work in progress.** `edge-gateway` and `simulator` are still being implemented. The rules
+  engine uses fixed thresholds only: the adaptive baseline and alert escalation are TODO.
+- **Security shortcuts.** Both certificates are self-signed and throwaway (MQTT CA, and Traefik's
+  default HTTPS certificate, hence the browser warning and no HSTS). Only `api` has a
+  least-privilege database role; `ingestor` and `rules-engine` still use the database owner.
+  Traffic inside `cloud_net` (proxy to api, services to database) is not encrypted. Traefik mounts
+  the Docker socket read-only to discover replicas, which is root-equivalent access.
+- **Trusted forwarding headers.** The api trusts `X-Forwarded-For` from any peer to log client
+  IPs; only Traefik reaches it, but another `cloud_net` container could spoof the logged IP.
+- **Rate limits are per proxy instance** and in memory: fine for one Traefik, not shared across
+  several. Behind NAT, all clients share one IP and therefore one limit.
 - **IDS visibility.** Suricata only sees traffic on the gateway, and not MQTT topics or payloads
   because of TLS. Unauthorised topics are silently dropped by the broker ACL instead.
 - **The PLC accepts Modbus writes**, like most real PLCs. Read-only is the gateway's policy;
@@ -146,7 +167,11 @@ docs/architecture.mmd  architecture diagram
 
 ## Troubleshooting
 
-- **Port 80 in use**: set `PROXY_HTTP_PORT=8080` in `.env` and use http://localhost:8080.
+- **Port 80 or 443 in use**: set `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` in `.env`. The HTTP
+  redirect always targets port 443, so with another HTTPS port open https://localhost:<port> directly.
+- **Database schema changed after a pull** (e.g. `relation "users" does not exist`): init scripts
+  only run on an empty volume. Recreate just the database with
+  `docker compose rm -sf timescaledb && docker volume rm factorysense_timescaledb-data && docker compose up -d --wait`.
 - **Build fails with `lookup registry-1.docker.io: i/o timeout`**: your active buildx builder
   cannot resolve DNS. Run `docker buildx use default` and build again.
 - **Changed a database setting and nothing happened**: `POSTGRES_*` and `TELEMETRY_*` values, and

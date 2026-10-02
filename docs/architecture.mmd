@@ -40,7 +40,7 @@ flowchart LR
       direction TB
       API["Query API<br/>REST and WebSocket<br/>[api: x N replicas]"]
       FE["Dashboard<br/>static HTML/JS<br/>[frontend]"]
-      PX["Reverse proxy / load balancer<br/>only public port :80<br/>[proxy: Traefik]"]
+      PX["Reverse proxy, load balancer, security layer<br/>public :443 HTTPS (:80 redirects)<br/>[proxy: Traefik]"]
       API --> PX
       FE --> PX
     end
@@ -54,7 +54,7 @@ flowchart LR
   RE <-->|"sliding window<br/>alerts"| DB
   IDS -.->|"security alerts<br/>(eve.json)"| RE
   DB --> API
-  PX ==>|"HTTP"| USERS
+  PX ==>|"HTTPS"| USERS
   RE -.->|"push: email, SMS, chat<br/>(future work)"| USERS
 
   classDef plant fill:#FAECE7,stroke:#D85A30,stroke-width:1px,color:#712B13
