@@ -8,9 +8,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import paho.mqtt.client as mqtt
-import psycopg2
-from psycopg2.extras import Json
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg.conninfo import make_conninfo
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 SERVICE = os.getenv("SERVICE_NAME", "rules-engine")
 PORT = int(os.getenv("PORT", "8000"))
@@ -56,8 +56,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(SERVICE)
 
-# Connection pool & thread synchronization
-db_pool: ThreadedConnectionPool | None = None
+# Connection pool (opened in init_db_pool) & thread synchronization
+db_pool = ConnectionPool(
+    make_conninfo(host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
+                  user=POSTGRES_USER, password=POSTGRES_PASSWORD, connect_timeout=5),
+    min_size=2, max_size=10, open=False, kwargs={"autocommit": True},
+)
 last_seen_machines: dict[str, dict] = {}
 lock = threading.Lock()
 
@@ -81,95 +85,66 @@ class Health(BaseHTTPRequestHandler):
 # 2. Database Connection Pool & Operations
 # ----------------------------------------------------------------------
 def init_db_pool():
-    global db_pool
-    while db_pool is None:
+    db_pool.open()  # connects in the background and keeps retrying on its own
+    while True:
         try:
-            db_pool = ThreadedConnectionPool(
-                minconn=2,
-                maxconn=10,
-                host=POSTGRES_HOST,
-                port=POSTGRES_PORT,
-                dbname=POSTGRES_DB,
-                user=POSTGRES_USER,
-                password=POSTGRES_PASSWORD,
-                connect_timeout=5,
-            )
-            log.info("Database connection pool initialized")
-        except Exception as e:
-            log.warning("Database not ready yet (%s). Retrying in 3s...", e)
-            time.sleep(3)
+            db_pool.wait(timeout=10)
+            break
+        except PoolTimeout:
+            log.warning("Database not ready yet. Still retrying...")
+    log.info("Database connection pool initialized")
 
     # The schema belongs to config/timescaledb/init/020-app-schema.sql; fail loudly if it is missing
     # (a timescaledb-data volume created before that file existed) instead of creating it here.
-    conn = db_pool.getconn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT to_regclass('public.alerts')")
-            if cur.fetchone()[0] is None:
-                log.error("Table 'alerts' is missing: the DB volume predates 020-app-schema.sql. "
-                          "Reset it with `docker compose down -v` or run that file with psql.")
-            else:
-                log.info("Alerts table found in database")
-        conn.rollback()
-    finally:
-        db_pool.putconn(conn)
+    with db_pool.connection() as conn:
+        if conn.execute("SELECT to_regclass('public.alerts')").fetchone()[0] is None:
+            log.error("Table 'alerts' is missing: the DB volume predates 020-app-schema.sql. "
+                      "Reset it with `docker compose down -v` or run that file with psql.")
+        else:
+            log.info("Alerts table found in database")
 
 
 def save_or_dedupe_alert(source: str, site_id: str | None, machine_id: str | None,
                          rule_name: str, severity: str, details: dict, dedupe_key: str):
-    """Opens an alert, or bumps the active one with the same key. One atomic statement, so the
-    MQTT, IDS and watchdog threads cannot race into duplicate active alerts."""
-    conn = None
+    """Opens an alert, or bumps the open one (active or acknowledged) with the same key. One atomic
+    statement, so the MQTT, IDS and watchdog threads cannot race into duplicate open alerts."""
     try:
-        conn = db_pool.getconn()
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("""
+        with db_pool.connection() as conn:
+            alert_id, count = conn.execute("""
                 INSERT INTO alerts (source, site_id, machine_id, rule_name, severity, details, dedupe_key)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (dedupe_key) WHERE status = 'active' DO UPDATE
+                ON CONFLICT (dedupe_key) WHERE status <> 'resolved' DO UPDATE
                 SET count = alerts.count + 1,
                     last_seen = now(),
                     severity = EXCLUDED.severity,
                     rule_name = EXCLUDED.rule_name,
                     details = EXCLUDED.details
                 RETURNING id, count;
-            """, (source, site_id, machine_id, rule_name, severity, Json(details), dedupe_key))
-            alert_id, count = cur.fetchone()
-            if count == 1:
-                log.warning("NEW ALERT [%s] id=%d severity=%s rule='%s' site=%s machine=%s",
-                            source, alert_id, severity, rule_name, site_id, machine_id)
-            else:
-                log.info("Updated active alert [%s] id=%d count=%d rule='%s' severity=%s",
-                         source, alert_id, count, rule_name, severity)
+            """, (source, site_id, machine_id, rule_name, severity, Jsonb(details), dedupe_key)).fetchone()
+        if count == 1:
+            log.warning("NEW ALERT [%s] id=%d severity=%s rule='%s' site=%s machine=%s",
+                        source, alert_id, severity, rule_name, site_id, machine_id)
+        else:
+            log.info("Updated open alert [%s] id=%d count=%d rule='%s' severity=%s",
+                     source, alert_id, count, rule_name, severity)
     except Exception as e:
         log.error("Failed to save alert: %s", e)
-    finally:
-        if conn:
-            db_pool.putconn(conn)
 
 
 def resolve_alert(dedupe_key: str):
-    """Marks an active alert as resolved when telemetry returns to normal."""
-    conn = None
+    """Resolves the open alert (acknowledged or not) when telemetry returns to normal."""
     try:
-        conn = db_pool.getconn()
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("""
+        with db_pool.connection() as conn:
+            row = conn.execute("""
                 UPDATE alerts
                 SET status = 'resolved', resolved_at = now()
-                WHERE dedupe_key = %s AND status = 'active'
+                WHERE dedupe_key = %s AND status <> 'resolved'
                 RETURNING id, rule_name;
-            """, (dedupe_key,))
-            row = cur.fetchone()
-            if row:
-                log.info("RESOLVED alert id=%d rule='%s' (metric returned to normal)", row[0], row[1])
+            """, (dedupe_key,)).fetchone()
+        if row:
+            log.info("RESOLVED alert id=%d rule='%s' (metric returned to normal)", row[0], row[1])
     except Exception as e:
         log.error("Failed to resolve alert: %s", e)
-    finally:
-        if conn:
-            db_pool.putconn(conn)
 
 
 # ----------------------------------------------------------------------
