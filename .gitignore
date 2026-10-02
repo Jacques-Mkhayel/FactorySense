@@ -1,5 +1,4 @@
-# Secrets
-.env
+# Secrets. .env is committed on purpose with demo values only (see README "Limits").
 config/mosquitto/certs/
 
 # Python

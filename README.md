@@ -37,8 +37,7 @@ start and exits with code 0.
 Requirements: Docker with Compose v2, and ports 80 and 443 free (see Troubleshooting otherwise).
 
 ```bash
-cp .env.example .env          # then replace the change-me values
-docker compose up -d --build --wait
+docker compose up -d --build --wait   # .env ships with demo values; edit it for anything real
 docker compose ps             # 10 services "healthy", mqtt-certs "Exited (0)"
 ```
 
@@ -123,8 +122,8 @@ proxy; scrypt password hashes and server-side sessions in an `HttpOnly`, `Secure
 management with no public sign-up; and a least-privilege `api` database role that can read
 telemetry and alerts but only change an alert's workflow columns.
 
-Configuration lives in `.env` (see comments in [`.env.example`](.env.example)).
-No secrets or certificates are committed.
+Configuration lives in [`.env`](.env), committed with demo values only. No certificates or keys
+are committed: they are generated on first start.
 
 ## Repository layout
 
@@ -150,6 +149,9 @@ docs/architecture.mmd  architecture diagram
   least-privilege database role; `ingestor` and `rules-engine` still use the database owner.
   Traffic inside `cloud_net` (proxy to api, services to database) is not encrypted. Traefik mounts
   the Docker socket read-only to discover replicas, which is root-equivalent access.
+- **Demo credentials are public.** `.env` is committed so the stack runs right after a clone; every
+  `change-me` password in it is known to anyone with the repository. Replace them before exposing
+  the stack, and do not commit real credentials (or untrack `.env` with `git rm --cached .env`).
 - **Trusted forwarding headers.** The api trusts `X-Forwarded-For` from any peer to log client
   IPs; only Traefik reaches it, but another `cloud_net` container could spoof the logged IP.
 - **Rate limits are per proxy instance** and in memory: fine for one Traefik, not shared across
