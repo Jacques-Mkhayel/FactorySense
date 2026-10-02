@@ -52,6 +52,15 @@ THRESHOLDS = {
         "max_critical": float(os.getenv("PRESS_MAX_CRIT", "5.0")),
     },
 }
+# Hysteresis, the same idea as the gateway's 85/80 C: an open alert only resolves once the value is back
+# past threshold -/+ margin, and a critical only drops to warning below critical - margin, so a reading
+# hovering at a threshold does not open and close alerts every second. Each clear point stays outside
+# the simulator's normal range above, or alerts would linger after the machine is back to normal.
+HYSTERESIS = {
+    "temperature": float(os.getenv("TEMP_HYSTERESIS", "2.0")),  # clears below 73 C
+    "vibration": float(os.getenv("VIB_HYSTERESIS", "0.5")),     # clears below 3.5 mm/s
+    "pressure": float(os.getenv("PRESS_HYSTERESIS", "0.2")),    # clears between 3.7 and 4.8 bar
+}
 SENSOR_TIMEOUT_S = float(os.getenv("SENSOR_TIMEOUT_S", "10.0"))
 
 logging.basicConfig(
@@ -109,22 +118,30 @@ def init_db_pool():
 
 
 def save_or_dedupe_alert(source: str, site_id: str | None, machine_id: str | None,
-                         rule_name: str, severity: str, details: dict, dedupe_key: str):
+                         rule_name: str, severity: str, details: dict, dedupe_key: str,
+                         at: datetime | None = None, keep_critical: bool = False):
     """Opens an alert, or bumps the open one (active or acknowledged) with the same key. One atomic
-    statement, so the MQTT, IDS and watchdog threads cannot race into duplicate open alerts."""
+    statement, so the MQTT, IDS and watchdog threads cannot race into duplicate open alerts.
+    `at` is when the condition was measured (now if unknown); `keep_critical` stops an open critical
+    alert from being downgraded while the value is still inside the critical hysteresis band."""
+    keep = "%(keep)s AND alerts.severity = 'critical'"
     try:
         with db_pool.connection() as conn:
-            alert_id, count = conn.execute("""
-                INSERT INTO alerts (source, site_id, machine_id, rule_name, severity, details, dedupe_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            alert_id, count = conn.execute(f"""
+                INSERT INTO alerts (time, last_seen, source, site_id, machine_id, rule_name, severity,
+                                    details, dedupe_key)
+                VALUES (coalesce(%(at)s, now()), coalesce(%(at)s, now()), %(source)s, %(site)s,
+                        %(machine)s, %(rule)s, %(severity)s, %(details)s, %(key)s)
                 ON CONFLICT (dedupe_key) WHERE status <> 'resolved' DO UPDATE
                 SET count = alerts.count + 1,
-                    last_seen = now(),
-                    severity = EXCLUDED.severity,
-                    rule_name = EXCLUDED.rule_name,
+                    last_seen = greatest(alerts.last_seen, EXCLUDED.last_seen),
+                    severity = CASE WHEN {keep} THEN alerts.severity ELSE EXCLUDED.severity END,
+                    rule_name = CASE WHEN {keep} THEN alerts.rule_name ELSE EXCLUDED.rule_name END,
                     details = EXCLUDED.details
                 RETURNING id, count;
-            """, (source, site_id, machine_id, rule_name, severity, Jsonb(details), dedupe_key)).fetchone()
+            """, {"at": at, "source": source, "site": site_id, "machine": machine_id, "rule": rule_name,
+                  "severity": severity, "details": Jsonb(details), "key": dedupe_key,
+                  "keep": keep_critical}).fetchone()
         if count == 1:
             log.warning("NEW ALERT [%s] id=%d severity=%s rule='%s' site=%s machine=%s",
                         source, alert_id, severity, rule_name, site_id, machine_id)
@@ -135,16 +152,17 @@ def save_or_dedupe_alert(source: str, site_id: str | None, machine_id: str | Non
         log.error("Failed to save alert: %s", e)
 
 
-def resolve_alert(dedupe_key: str):
-    """Resolves the open alert (acknowledged or not) when telemetry returns to normal."""
+def resolve_alert(dedupe_key: str, at: datetime | None = None):
+    """Resolves the open alert (acknowledged or not) when telemetry returns to normal, at the time the
+    normal reading was measured (never before the alert itself opened)."""
     try:
         with db_pool.connection() as conn:
             row = conn.execute("""
                 UPDATE alerts
-                SET status = 'resolved', resolved_at = now()
+                SET status = 'resolved', resolved_at = greatest(coalesce(%s, now()), time)
                 WHERE dedupe_key = %s AND status <> 'resolved'
                 RETURNING id, rule_name;
-            """, (dedupe_key,)).fetchone()
+            """, (at, dedupe_key)).fetchone()
         if row:
             log.info("RESOLVED alert id=%d rule='%s' (metric returned to normal)", row[0], row[1])
     except Exception as e:
@@ -252,6 +270,20 @@ def _reading(payload: dict, field: str) -> float | None:
     return None
 
 
+def _reading_time(payload: dict) -> datetime | None:
+    """When the reading was measured (`ts`, Unix ms). After a WAN outage the gateway replays readings
+    late, and an alert must carry the time the condition happened, not the time it was processed."""
+    ts = payload.get("ts")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    try:
+        measured = datetime.fromtimestamp(ts / 1000, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    # A gateway clock running ahead must not date alerts in the future.
+    return min(measured, datetime.now(timezone.utc))
+
+
 def handle_edge_event(payload: dict):
     """Alarm transitions raised by the gateway itself (factorysense/status/...). They are decided at
     the edge, so they keep working through a WAN outage and arrive later with their original `ts`."""
@@ -263,22 +295,20 @@ def handle_edge_event(payload: dict):
     machine_id = str(payload.get("machine_id", "unknown"))
     rule = str(payload.get("rule", "unknown"))[:64]
     dedupe_key = f"edge:{site_id}:{machine_id}:{rule}"
+    at = _reading_time(payload)
     if state == "resolved":
-        resolve_alert(dedupe_key)
+        resolve_alert(dedupe_key, at)
         return
-    ts = payload.get("ts")
-    measured_at = (datetime.fromtimestamp(ts / 1000, timezone.utc).isoformat()
-                   if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None)
     severity = payload.get("severity")
     details = {
-        "origin": "edge-gateway", "rule": rule, "measured_at": measured_at,
+        "origin": "edge-gateway", "rule": rule, "measured_at": at.isoformat() if at else None,
         "temperature": _reading(payload, "temperature"),
         "critical_c": _reading(payload, "critical_c"), "clear_c": _reading(payload, "clear_c"),
         "features": payload.get("features") if isinstance(payload.get("features"), dict) else None,
     }
     save_or_dedupe_alert("equipment", site_id, machine_id, f"Edge local alarm: {rule}",
                          severity if severity in ("info", "warning", "critical") else "critical",
-                         details, dedupe_key)
+                         details, dedupe_key, at)
 
 
 def on_mqtt_message(_client, _userdata, msg):
@@ -306,41 +336,38 @@ def on_mqtt_message(_client, _userdata, msg):
             "last_seen": time.time(),
         }
 
-    # If sensor was silent, resolve the sensor loss alert
+    # Data arrived again: the sensor-loss alert is about arrival, so it resolves at arrival time.
     resolve_alert(f"equipment:{site_id}:{machine_id}:sensor_loss")
+    at = _reading_time(payload)
 
-    # --- 1. Temperature Check ---
-    temp_key = f"equipment:{site_id}:{machine_id}:temp"
-    if temp is not None:
-        if temp >= THRESHOLDS["temperature"]["critical"]:
-            save_or_dedupe_alert("equipment", site_id, machine_id, "Critical High Temperature", "critical",
-                                 {"metric": "temperature", "value": temp, "unit": "°C"}, temp_key)
-        elif temp >= THRESHOLDS["temperature"]["warning"]:
-            save_or_dedupe_alert("equipment", site_id, machine_id, "High Temperature Warning", "warning",
-                                 {"metric": "temperature", "value": temp, "unit": "°C"}, temp_key)
-        else:
-            resolve_alert(temp_key)
+    # --- 1 & 2. Temperature and vibration: warning / critical, with hysteresis ---
+    for metric, value, unit, label, short in (("temperature", temp, "°C", "Temperature", "temp"),
+                                              ("vibration", vib, "mm/s", "Vibration", "vib")):
+        if value is None:
+            continue
+        key = f"equipment:{site_id}:{machine_id}:{short}"
+        warn, crit, margin = THRESHOLDS[metric]["warning"], THRESHOLDS[metric]["critical"], HYSTERESIS[metric]
+        details = {"metric": metric, "value": value, "unit": unit}
+        if value >= crit:
+            save_or_dedupe_alert("equipment", site_id, machine_id, f"Critical High {label}", "critical",
+                                 details, key, at)
+        elif value >= warn:
+            save_or_dedupe_alert("equipment", site_id, machine_id, f"High {label} Warning", "warning",
+                                 details, key, at, keep_critical=value >= crit - margin)
+        elif value < warn - margin:
+            resolve_alert(key, at)
+        # else: inside the hysteresis band, an open alert stays open and no new one opens
 
-    # --- 2. Vibration Check ---
-    vib_key = f"equipment:{site_id}:{machine_id}:vib"
-    if vib is not None:
-        if vib >= THRESHOLDS["vibration"]["critical"]:
-            save_or_dedupe_alert("equipment", site_id, machine_id, "Critical High Vibration", "critical",
-                                 {"metric": "vibration", "value": vib, "unit": "mm/s"}, vib_key)
-        elif vib >= THRESHOLDS["vibration"]["warning"]:
-            save_or_dedupe_alert("equipment", site_id, machine_id, "High Vibration Warning", "warning",
-                                 {"metric": "vibration", "value": vib, "unit": "mm/s"}, vib_key)
-        else:
-            resolve_alert(vib_key)
-
-    # --- 3. Pressure Check ---
+    # --- 3. Pressure: out of range on either side, with hysteresis ---
     press_key = f"equipment:{site_id}:{machine_id}:press"
     if press is not None:
-        if press <= THRESHOLDS["pressure"]["min_critical"] or press >= THRESHOLDS["pressure"]["max_critical"]:
-            save_or_dedupe_alert("equipment", site_id, machine_id, "Critical Hydraulic Pressure Out of Range", "critical",
-                                 {"metric": "pressure", "value": press, "unit": "bar"}, press_key)
-        else:
-            resolve_alert(press_key)
+        low, high = THRESHOLDS["pressure"]["min_critical"], THRESHOLDS["pressure"]["max_critical"]
+        margin = HYSTERESIS["pressure"]
+        if press <= low or press >= high:
+            save_or_dedupe_alert("equipment", site_id, machine_id, "Critical Hydraulic Pressure Out of Range",
+                                 "critical", {"metric": "pressure", "value": press, "unit": "bar"}, press_key, at)
+        elif low + margin < press < high - margin:
+            resolve_alert(press_key, at)
 
 
 def mqtt_worker():

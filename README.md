@@ -573,14 +573,15 @@ regenerates certificates and re-runs database init).
 
 Run these from the repository root with the stack up.
 
-**Send a reading through the whole pipeline** (MQTT/TLS → Telegraf → TimescaleDB):
+**Send a reading through the whole pipeline** (MQTT/TLS → Telegraf → TimescaleDB). The ingestor
+only stores complete readings: `ts`, `site_id`, `machine_id` and all three numeric measurements.
 
 ```bash
 source .env
 docker run --rm --network factorysense_cloud_net -v factorysense_mqtt-tls-ca:/certs:ro \
   eclipse-mosquitto:2.1-alpine mosquitto_pub -h mosquitto -p 8883 --cafile /certs/ca.crt \
   -u gateway -P "$MQTT_GATEWAY_PASSWORD" -q 1 -t factorysense/telemetry/plant-01/press-01 \
-  -m "{\"ts\":$(date +%s000),\"site_id\":\"plant-01\",\"machine_id\":\"press-01\",\"temperature\":71.5}"
+  -m "{\"ts\":$(date +%s000),\"site_id\":\"plant-01\",\"machine_id\":\"press-01\",\"temperature\":71.5,\"pressure\":4.2,\"vibration\":0.8}"
 sleep 5   # Telegraf writes every 5 s
 docker compose exec timescaledb psql -U factorysense -c "SELECT * FROM telemetry ORDER BY time DESC LIMIT 5;"
 ```
@@ -630,7 +631,14 @@ docker compose start mosquitto
    into `telemetry_1h` and drops raw data after 30 days (rollups after 365).
 4. `rules-engine` evaluates the same stream, the gateway's own alarm transitions
    (`factorysense/status/...`) and Suricata's `eve.json`, and stores alerts with a `source` of
-   `equipment` or `ids`. Its thresholds are calibrated against the simulator's normal profile.
+   `equipment` or `ids`. Its thresholds are calibrated against the simulator's normal profile and
+   use hysteresis like the gateway: temperature alerts open at 75 °C but only resolve below 73 °C,
+   vibration at 4 / below 3.5 mm/s, pressure outside 3.5–5.0 / back within 3.7–4.8 bar, and a
+   critical only drops to warning 2 °C (0.5 mm/s) below its threshold. A value hovering at a
+   threshold therefore keeps one alert open instead of opening and closing one every second.
+   Alerts are dated with the reading's own `ts`, so readings replayed after a WAN outage produce
+   alerts at the time the condition happened, not when the cloud processed them (the sensor-silence
+   alert is the exception: it is about arrival, so it uses arrival time).
 5. A database trigger `NOTIFY`s every alert change; each `api` replica `LISTEN`s and pushes it to
    its dashboards over a WebSocket, so the alert feed is live without polling.
 6. `proxy` terminates TLS and exposes the API at `/api` and the dashboard at `/`. Analysts can
@@ -664,8 +672,9 @@ docs/architecture.mmd  architecture diagram
 ## Limits
 
 - **Prototype, not production.** Single host, one broker, one database: no high availability.
-- **Fixed thresholds.** The rules engine uses fixed thresholds only: the adaptive baseline and
-  alert escalation are TODO.
+- **Fixed thresholds.** The rules engine uses fixed thresholds with hysteresis: the adaptive
+  baseline and alert escalation are TODO. It evaluates any numeric field it receives, even in a
+  reading the ingestor rejects as incomplete, so such an alert has no matching telemetry row.
 - **Security shortcuts.** Both certificates are self-signed and throwaway (MQTT CA, and Traefik's
   default HTTPS certificate, hence the browser warning and no HSTS). Only `api` has a
   least-privilege database role; `ingestor` and `rules-engine` still use the database owner.
