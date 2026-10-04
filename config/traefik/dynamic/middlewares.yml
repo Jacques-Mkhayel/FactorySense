@@ -1,0 +1,49 @@
+http:
+  middlewares:
+    # The API is mounted under /api at the edge but serves from / internally.
+    api-strip:
+      stripPrefix:
+        prefixes: ["/api"]
+
+    # Applied to every router.
+    security-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        referrerPolicy: same-origin
+        permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+        # An empty value removes the header: do not advertise the backend software.
+        customResponseHeaders:
+          Server: ""
+        # No HSTS on purpose: browsers ignore it on a self-signed certificate anyway.
+
+    # Dashboard only. Scripts, styles and connections (including the WebSocket) come from this origin
+    # only, so injected markup cannot load or exfiltrate anything. Not on /api, whose /api/docs page
+    # loads Swagger UI from a CDN.
+    frontend-csp:
+      headers:
+        contentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+
+    # Per client IP. Generous for a handful of engineers, tight enough to blunt scripted abuse.
+    api-ratelimit:
+      rateLimit:
+        average: 20
+        period: 1s
+        burst: 60
+
+    # Brute-force guard on the login endpoint: 5 attempts per minute per client IP.
+    login-ratelimit:
+      rateLimit:
+        average: 5
+        period: 1m
+        burst: 5
+
+    # No API body needs more than a few KB; bigger requests are refused at the edge.
+    api-body-limit:
+      buffering:
+        maxRequestBodyBytes: 65536
+
+    # Caps concurrent requests (open WebSockets included) per client IP.
+    api-inflight:
+      inFlightReq:
+        amount: 50

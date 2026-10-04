@@ -1,0 +1,79 @@
+%% FactorySense - Industrial IoT Monitoring System
+%% Hybrid edge / public cloud architecture, one node per Docker Compose service.
+%% Container names are shown in [brackets]; they match `docker compose ps`.
+%% Colours: orange = plant floor, red = security, green = stateless cloud service,
+%% purple = stateful cloud service (named volume), dashed = one-shot job.
+%% Paste the whole file into https://mermaid.live to render or export it.
+
+flowchart LR
+
+  subgraph PLANT["PLANT FLOOR · plant_net<br/>internal: no route to cloud or internet"]
+    direction TB
+    SIM["Machine / PLC<br/>vibration, temperature, pressure<br/>[simulator]"]
+    GW["Edge gateway<br/>72h buffer, features, local rules<br/>listens on no port<br/>[edge-gateway]"]
+    IDS["Network IDS<br/>inspects all gateway traffic<br/>[ids: Suricata]"]
+    SIM -->|"Modbus TCP 502<br/>read-only"| GW
+    IDS -.-|"shares network<br/>namespace"| GW
+  end
+
+  subgraph CLOUD["PUBLIC CLOUD · cloud_net"]
+    direction LR
+
+    subgraph INGEST["Ingestion"]
+      direction TB
+      CERTS["TLS bootstrap<br/>runs once<br/>[mqtt-certs]"]
+      MQ["MQTT broker<br/>device auth, ACL, TLS only<br/>[mosquitto]"]
+      ING["Ingestor<br/>config only<br/>[ingestor: Telegraf]"]
+      CERTS -.->|"certificates"| MQ
+      MQ -->|"telemetry"| ING
+    end
+
+    subgraph PROC["Processing"]
+      RE["Rules engine + alert handling<br/>thresholds, adaptive baseline<br/>dedupe, severity, escalation<br/>[rules-engine]"]
+    end
+
+    subgraph STORE["Storage"]
+      DB[("PostgreSQL + TimescaleDB<br/>telemetry hypertable, hourly rollup<br/>assets, users, alerts, work orders<br/>[timescaledb]")]
+    end
+
+    subgraph PRES["Presentation"]
+      direction TB
+      API["Query API<br/>REST and WebSocket<br/>[api: x N replicas]"]
+      FE["Dashboard<br/>static HTML/JS<br/>[frontend]"]
+      PX["Reverse proxy, load balancer, security layer<br/>public :443 HTTPS (:80 redirects)<br/>[proxy: Traefik]"]
+      API --> PX
+      FE --> PX
+    end
+  end
+
+  USERS["Operators, technicians,<br/>managers<br/>(web browser)"]
+
+  GW ==>|"MQTT over TLS 8883<br/>OUTBOUND ONLY"| MQ
+  MQ -->|"telemetry"| RE
+  ING -->|"insert"| DB
+  RE <-->|"sliding window<br/>alerts"| DB
+  IDS -.->|"security alerts<br/>(eve.json)"| RE
+  DB --> API
+  PX ==>|"HTTPS"| USERS
+  RE -.->|"push: email, SMS, chat<br/>(future work)"| USERS
+
+  classDef plant fill:#FAECE7,stroke:#D85A30,stroke-width:1px,color:#712B13
+  classDef stateless fill:#E1F5EE,stroke:#1D9E75,stroke-width:1px,color:#085041
+  classDef stateful fill:#EEEDFE,stroke:#7F77DD,stroke-width:1px,color:#3C3489
+  classDef people fill:#F1EFE8,stroke:#888780,stroke-width:1px,color:#444441
+  classDef security fill:#FCEBEB,stroke:#C0392B,stroke-width:1px,color:#7B241C
+  classDef job fill:#FFFFFF,stroke:#B4B2A9,stroke-width:1px,stroke-dasharray: 3 3,color:#444441
+
+  class SIM,GW plant
+  class ING,RE,API,FE,PX stateless
+  class MQ,DB stateful
+  class USERS people
+  class IDS security
+  class CERTS job
+
+  style PLANT fill:none,stroke:#D85A30,stroke-width:1px,stroke-dasharray: 6 4
+  style CLOUD fill:none,stroke:#888780,stroke-width:1px,stroke-dasharray: 6 4
+  style INGEST fill:none,stroke:#B4B2A9,stroke-width:1px,stroke-dasharray: 3 3
+  style PROC fill:none,stroke:#B4B2A9,stroke-width:1px,stroke-dasharray: 3 3
+  style STORE fill:none,stroke:#B4B2A9,stroke-width:1px,stroke-dasharray: 3 3
+  style PRES fill:none,stroke:#B4B2A9,stroke-width:1px,stroke-dasharray: 3 3

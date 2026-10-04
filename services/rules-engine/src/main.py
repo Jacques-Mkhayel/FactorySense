@@ -1,0 +1,447 @@
+"""Rules engine: detects equipment anomalies and manages Suricata IDS alerts."""
+import json
+import logging
+import os
+import ssl
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import paho.mqtt.client as mqtt
+from psycopg.conninfo import make_conninfo
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool, PoolTimeout
+
+SERVICE = os.getenv("SERVICE_NAME", "rules-engine")
+PORT = int(os.getenv("PORT", "8000"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# MQTT Configuration
+MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
+MQTT_USER = os.getenv("MQTT_USER", "rules-engine")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+MQTT_CA_FILE = os.getenv("MQTT_CA_FILE", "/certs/ca.crt")
+
+# Database Configuration
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "timescaledb")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "factorysense")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "factorysense")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+
+# IDS eve.json path
+IDS_EVE_PATH = os.getenv("IDS_EVE_PATH", "/var/log/suricata/eve.json")
+
+# Calibrated against the simulator's normal profile (services/simulator, README "Simulator measurement
+# generation"): temperature 67.8-72.2 C, pressure 4.03-4.37 bar, vibration 0.68-0.92 mm/s. Every normal
+# reading stays clear of every threshold; TEMP_CRIT matches the gateway's LOCAL_TEMP_CRITICAL_C (85 C).
+THRESHOLDS = {
+    "temperature": {
+        "warning": float(os.getenv("TEMP_WARN_THRESHOLD", "75.0")),
+        "critical": float(os.getenv("TEMP_CRIT_THRESHOLD", "85.0")),
+    },
+    "vibration": {
+        "warning": float(os.getenv("VIB_WARN_THRESHOLD", "4.0")),
+        "critical": float(os.getenv("VIB_CRIT_THRESHOLD", "6.0")),
+    },
+    "pressure": {
+        # Centred on the 4.2 bar operating point, about 4x the normal swing away on each side.
+        "min_critical": float(os.getenv("PRESS_MIN_CRIT", "3.5")),
+        "max_critical": float(os.getenv("PRESS_MAX_CRIT", "5.0")),
+    },
+}
+# Hysteresis, the same idea as the gateway's 85/80 C: an open alert only resolves once the value is back
+# past threshold -/+ margin, and a critical only drops to warning below critical - margin, so a reading
+# hovering at a threshold does not open and close alerts every second. Each clear point stays outside
+# the simulator's normal range above, or alerts would linger after the machine is back to normal.
+HYSTERESIS = {
+    "temperature": float(os.getenv("TEMP_HYSTERESIS", "2.0")),  # clears below 73 C
+    "vibration": float(os.getenv("VIB_HYSTERESIS", "0.5")),     # clears below 3.5 mm/s
+    "pressure": float(os.getenv("PRESS_HYSTERESIS", "0.2")),    # clears between 3.7 and 4.8 bar
+}
+SENSOR_TIMEOUT_S = float(os.getenv("SENSOR_TIMEOUT_S", "10.0"))
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s level=%(levelname)s service=%(name)s msg=%(message)s"
+)
+log = logging.getLogger(SERVICE)
+
+# Connection pool (opened in init_db_pool) & thread synchronization
+db_pool = ConnectionPool(
+    make_conninfo(host=POSTGRES_HOST, port=POSTGRES_PORT, dbname=POSTGRES_DB,
+                  user=POSTGRES_USER, password=POSTGRES_PASSWORD, connect_timeout=5),
+    min_size=2, max_size=10, open=False, kwargs={"autocommit": True},
+)
+last_seen_machines: dict[str, dict] = {}
+lock = threading.Lock()
+
+
+# ----------------------------------------------------------------------
+# 1. Healthcheck HTTP Server
+# ----------------------------------------------------------------------
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        status, body = (200, {"status": "ok"}) if self.path == "/health" else (404, {"error": "not found"})
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def log_message(self, fmt, *args):
+        log.debug(fmt, *args)
+
+
+# ----------------------------------------------------------------------
+# 2. Database Connection Pool & Operations
+# ----------------------------------------------------------------------
+def init_db_pool():
+    db_pool.open()  # connects in the background and keeps retrying on its own
+    while True:
+        try:
+            db_pool.wait(timeout=10)
+            break
+        except PoolTimeout:
+            log.warning("Database not ready yet. Still retrying...")
+    log.info("Database connection pool initialized")
+
+    # The schema belongs to config/timescaledb/init/020-app-schema.sql; fail loudly if it is missing
+    # (a timescaledb-data volume created before that file existed) instead of creating it here.
+    with db_pool.connection() as conn:
+        if conn.execute("SELECT to_regclass('public.alerts')").fetchone()[0] is None:
+            log.error("Table 'alerts' is missing: the DB volume predates 020-app-schema.sql. "
+                      "Reset it with `docker compose down -v` or run that file with psql.")
+        else:
+            log.info("Alerts table found in database")
+
+
+def save_or_dedupe_alert(source: str, site_id: str | None, machine_id: str | None,
+                         rule_name: str, severity: str, details: dict, dedupe_key: str,
+                         at: datetime | None = None, keep_critical: bool = False):
+    """Opens an alert, or bumps the open one (active or acknowledged) with the same key. One atomic
+    statement, so the MQTT, IDS and watchdog threads cannot race into duplicate open alerts.
+    `at` is when the condition was measured (now if unknown); `keep_critical` stops an open critical
+    alert from being downgraded while the value is still inside the critical hysteresis band."""
+    keep = "%(keep)s AND alerts.severity = 'critical'"
+    try:
+        with db_pool.connection() as conn:
+            alert_id, count = conn.execute(f"""
+                INSERT INTO alerts (time, last_seen, source, site_id, machine_id, rule_name, severity,
+                                    details, dedupe_key)
+                VALUES (coalesce(%(at)s, now()), coalesce(%(at)s, now()), %(source)s, %(site)s,
+                        %(machine)s, %(rule)s, %(severity)s, %(details)s, %(key)s)
+                ON CONFLICT (dedupe_key) WHERE status <> 'resolved' DO UPDATE
+                SET count = alerts.count + 1,
+                    last_seen = greatest(alerts.last_seen, EXCLUDED.last_seen),
+                    severity = CASE WHEN {keep} THEN alerts.severity ELSE EXCLUDED.severity END,
+                    rule_name = CASE WHEN {keep} THEN alerts.rule_name ELSE EXCLUDED.rule_name END,
+                    details = EXCLUDED.details
+                RETURNING id, count;
+            """, {"at": at, "source": source, "site": site_id, "machine": machine_id, "rule": rule_name,
+                  "severity": severity, "details": Jsonb(details), "key": dedupe_key,
+                  "keep": keep_critical}).fetchone()
+        if count == 1:
+            log.warning("NEW ALERT [%s] id=%d severity=%s rule='%s' site=%s machine=%s",
+                        source, alert_id, severity, rule_name, site_id, machine_id)
+        else:
+            log.info("Updated open alert [%s] id=%d count=%d rule='%s' severity=%s",
+                     source, alert_id, count, rule_name, severity)
+    except Exception as e:
+        log.error("Failed to save alert: %s", e)
+
+
+def resolve_alert(dedupe_key: str, at: datetime | None = None):
+    """Resolves the open alert (acknowledged or not) when telemetry returns to normal, at the time the
+    normal reading was measured (never before the alert itself opened)."""
+    try:
+        with db_pool.connection() as conn:
+            row = conn.execute("""
+                UPDATE alerts
+                SET status = 'resolved', resolved_at = greatest(coalesce(%s, now()), time)
+                WHERE dedupe_key = %s AND status <> 'resolved'
+                RETURNING id, rule_name;
+            """, (at, dedupe_key)).fetchone()
+        if row:
+            log.info("RESOLVED alert id=%d rule='%s' (metric returned to normal)", row[0], row[1])
+    except Exception as e:
+        log.error("Failed to resolve alert: %s", e)
+
+
+# ----------------------------------------------------------------------
+# 3. IDS Suricata Worker (Tail eve.json)
+# ----------------------------------------------------------------------
+def ids_worker():
+    """Tails /var/log/suricata/eve.json with log rotation handling."""
+    log.info("IDS worker starting, waiting for %s...", IDS_EVE_PATH)
+    while not os.path.exists(IDS_EVE_PATH):
+        time.sleep(2)
+
+    current_inode = None
+    f = None
+
+    while True:
+        try:
+            if not os.path.exists(IDS_EVE_PATH):
+                time.sleep(1)
+                continue
+
+            inode = os.stat(IDS_EVE_PATH).st_ino
+            if inode != current_inode:
+                if f:
+                    f.close()
+                f = open(IDS_EVE_PATH, "r", encoding="utf-8")
+                f.seek(0, os.SEEK_END)
+                current_inode = inode
+                log.info("Opened/re-opened IDS log file %s", IDS_EVE_PATH)
+
+            line = f.readline()
+            if not line:
+                time.sleep(0.5)
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if event.get("event_type") != "alert":
+                continue
+
+            alert_info = event.get("alert", {})
+            signature = alert_info.get("signature", "Unknown IDS alert")
+            sig_id = alert_info.get("signature_id", 0)
+            suricata_sev = alert_info.get("severity", 3)
+            severity_map = {1: "critical", 2: "warning", 3: "info"}
+            severity = severity_map.get(suricata_sev, "warning")
+
+            src_ip = event.get("src_ip", "unknown")
+            dest_ip = event.get("dest_ip", "unknown")
+            dest_port = event.get("dest_port")
+
+            dedupe_key = f"ids:{sig_id}:{src_ip}->{dest_ip}"
+            details = {
+                "signature_id": sig_id,
+                "category": alert_info.get("category"),
+                "src_ip": src_ip,
+                "src_port": event.get("src_port"),
+                "dest_ip": dest_ip,
+                "dest_port": dest_port,
+                "proto": event.get("proto"),
+            }
+
+            save_or_dedupe_alert(
+                source="ids",
+                site_id="plant-01",
+                machine_id=None,
+                rule_name=signature,
+                severity=severity,
+                details=details,
+                dedupe_key=dedupe_key,
+            )
+        except Exception as e:
+            log.error("Error in IDS worker: %s", e)
+            time.sleep(1)
+
+
+# ----------------------------------------------------------------------
+# 4. MQTT Telemetry Worker (Equipment Rules + Auto-resolution)
+# ----------------------------------------------------------------------
+def on_mqtt_connect(client, _userdata, _flags, rc, _properties=None):
+    if rc == 0:
+        log.info("Connected to MQTT broker (Mosquitto TLS). Subscribing...")
+        # Raw readings for the cloud rules, and the gateway's own alarm transitions.
+        client.subscribe([("factorysense/telemetry/#", 1), ("factorysense/status/#", 1)])
+    else:
+        # paho 2 passes a ReasonCode object, not an int
+        log.error("MQTT connection failed: %s", rc)
+
+
+def _reading(payload: dict, field: str) -> float | None:
+    """Returns the field only if it is a real number. An exception here would escape paho's loop
+    and drop the MQTT connection, so a single malformed message must never reach a comparison."""
+    value = payload.get(field)
+    # bool is a subclass of int: a spoofed `true` must not pass as a reading
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if value is not None:
+        log.warning("Ignoring non-numeric %s=%r", field, value)
+    return None
+
+
+def _reading_time(payload: dict) -> datetime | None:
+    """When the reading was measured (`ts`, Unix ms). After a WAN outage the gateway replays readings
+    late, and an alert must carry the time the condition happened, not the time it was processed."""
+    ts = payload.get("ts")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    try:
+        measured = datetime.fromtimestamp(ts / 1000, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    # A gateway clock running ahead must not date alerts in the future.
+    return min(measured, datetime.now(timezone.utc))
+
+
+def handle_edge_event(payload: dict):
+    """Alarm transitions raised by the gateway itself (factorysense/status/...). They are decided at
+    the edge, so they keep working through a WAN outage and arrive later with their original `ts`."""
+    state = payload.get("state")
+    if payload.get("kind") != "local_alert" or state not in ("active", "resolved"):
+        log.warning("Ignoring status event kind=%r state=%r", payload.get("kind"), state)
+        return
+    site_id = str(payload.get("site_id", "unknown"))
+    machine_id = str(payload.get("machine_id", "unknown"))
+    rule = str(payload.get("rule", "unknown"))[:64]
+    dedupe_key = f"edge:{site_id}:{machine_id}:{rule}"
+    at = _reading_time(payload)
+    if state == "resolved":
+        resolve_alert(dedupe_key, at)
+        return
+    severity = payload.get("severity")
+    details = {
+        "origin": "edge-gateway", "rule": rule, "measured_at": at.isoformat() if at else None,
+        "temperature": _reading(payload, "temperature"),
+        "critical_c": _reading(payload, "critical_c"), "clear_c": _reading(payload, "clear_c"),
+        "features": payload.get("features") if isinstance(payload.get("features"), dict) else None,
+    }
+    save_or_dedupe_alert("equipment", site_id, machine_id, f"Edge local alarm: {rule}",
+                         severity if severity in ("info", "warning", "critical") else "critical",
+                         details, dedupe_key, at)
+
+
+def on_mqtt_message(_client, _userdata, msg):
+    try:
+        payload = json.loads(msg.payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        log.warning("Ignoring non-JSON message on %s", msg.topic)
+        return
+    if not isinstance(payload, dict):
+        log.warning("Ignoring non-object JSON on %s", msg.topic)
+        return
+    if msg.topic.startswith("factorysense/status/"):
+        handle_edge_event(payload)
+        return
+
+    site_id = str(payload.get("site_id", "unknown"))
+    machine_id = str(payload.get("machine_id", "unknown"))
+    temp = _reading(payload, "temperature")
+    vib = _reading(payload, "vibration")
+    press = _reading(payload, "pressure")
+
+    with lock:
+        last_seen_machines[machine_id] = {
+            "site_id": site_id,
+            "last_seen": time.time(),
+        }
+
+    # Data arrived again: the sensor-loss alert is about arrival, so it resolves at arrival time.
+    resolve_alert(f"equipment:{site_id}:{machine_id}:sensor_loss")
+    at = _reading_time(payload)
+
+    # --- 1 & 2. Temperature and vibration: warning / critical, with hysteresis ---
+    for metric, value, unit, label, short in (("temperature", temp, "°C", "Temperature", "temp"),
+                                              ("vibration", vib, "mm/s", "Vibration", "vib")):
+        if value is None:
+            continue
+        key = f"equipment:{site_id}:{machine_id}:{short}"
+        warn, crit, margin = THRESHOLDS[metric]["warning"], THRESHOLDS[metric]["critical"], HYSTERESIS[metric]
+        details = {"metric": metric, "value": value, "unit": unit}
+        if value >= crit:
+            save_or_dedupe_alert("equipment", site_id, machine_id, f"Critical High {label}", "critical",
+                                 details, key, at)
+        elif value >= warn:
+            save_or_dedupe_alert("equipment", site_id, machine_id, f"High {label} Warning", "warning",
+                                 details, key, at, keep_critical=value >= crit - margin)
+        elif value < warn - margin:
+            resolve_alert(key, at)
+        # else: inside the hysteresis band, an open alert stays open and no new one opens
+
+    # --- 3. Pressure: out of range on either side, with hysteresis ---
+    press_key = f"equipment:{site_id}:{machine_id}:press"
+    if press is not None:
+        low, high = THRESHOLDS["pressure"]["min_critical"], THRESHOLDS["pressure"]["max_critical"]
+        margin = HYSTERESIS["pressure"]
+        if press <= low or press >= high:
+            save_or_dedupe_alert("equipment", site_id, machine_id, "Critical Hydraulic Pressure Out of Range",
+                                 "critical", {"metric": "pressure", "value": press, "unit": "bar"}, press_key, at)
+        elif low + margin < press < high - margin:
+            resolve_alert(press_key, at)
+
+
+def mqtt_worker():
+    """Connects to Mosquitto over TLS and listens for telemetry."""
+    while not os.path.exists(MQTT_CA_FILE):
+        log.info("Waiting for CA certificate at %s...", MQTT_CA_FILE)
+        time.sleep(2)
+
+    # Persistent session (like Telegraf's): the broker queues QoS 1 messages while this client is away.
+    # After a WAN outage the gateway replays its buffer within a second or two of reconnecting, often
+    # before this client is back; a clean session would silently lose that backfill and edge alarms.
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="rules-engine", clean_session=False)
+    client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+    client.tls_set(ca_certs=MQTT_CA_FILE, tls_version=ssl.PROTOCOL_TLS_CLIENT)
+    client.on_connect = on_mqtt_connect
+    client.on_message = on_mqtt_message
+
+    log.info("Connecting to MQTT broker %s:%d (TLS)...", MQTT_HOST, MQTT_PORT)
+    while True:
+        try:
+            client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+            client.loop_forever()
+        except Exception as e:
+            log.warning("MQTT connection error: %s. Reconnecting in 3s...", e)
+            time.sleep(3)
+
+
+# ----------------------------------------------------------------------
+# 5. Watchdog Worker (Sensor Loss Detection)
+# ----------------------------------------------------------------------
+def watchdog_worker():
+    """Detects when a machine stops sending telemetry (Threat: Service Unavailability)."""
+    while True:
+        time.sleep(5)
+        now = time.time()
+        with lock:
+            machines = dict(last_seen_machines)
+
+        for machine_id, data in machines.items():
+            silence = now - data["last_seen"]
+            if silence > SENSOR_TIMEOUT_S:
+                site_id = data.get("site_id", "unknown")
+                save_or_dedupe_alert(
+                    source="equipment",
+                    site_id=site_id,
+                    machine_id=machine_id,
+                    rule_name="Sensor Silence / Loss of Signal",
+                    severity="critical",
+                    details={"machine_id": machine_id, "silence_seconds": round(silence, 1), "timeout_limit": SENSOR_TIMEOUT_S},
+                    dedupe_key=f"equipment:{site_id}:{machine_id}:sensor_loss"
+                )
+
+
+# ----------------------------------------------------------------------
+# Main Application Entrypoint
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    # 1. Health endpoint on all interfaces so other cloud_net services can probe it, not only the
+    #    container-local healthcheck. Safe here: rules-engine lives on cloud_net only, never on the gateway.
+    threading.Thread(
+        target=ThreadingHTTPServer(("0.0.0.0", PORT), Health).serve_forever,
+        daemon=True
+    ).start()
+    log.info("Health server listening on 0.0.0.0:%d", PORT)
+
+    # 2. Initialize Database pool & schema
+    init_db_pool()
+
+    # 3. Start background workers
+    threading.Thread(target=ids_worker, daemon=True, name="IDSWorker").start()
+    threading.Thread(target=mqtt_worker, daemon=True, name="MQTTWorker").start()
+    threading.Thread(target=watchdog_worker, daemon=True, name="WatchdogWorker").start()
+
+    log.info("Rules engine fully operational. Listening for IDS events and MQTT telemetry...")
+
+    while True:
+        time.sleep(1)

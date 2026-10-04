@@ -1,0 +1,21 @@
+# Least privilege per client: operations outside these grants are denied.
+# TLS hides MQTT topics from the network IDS; the broker enforces these permissions.
+# Topic layout: factorysense/<kind>/<site>/<machine>
+
+# Anonymous clients (only possible on the container-local healthcheck listener): broker uptime only.
+topic read $SYS/broker/uptime
+
+# Edge gateway: publishes plant data, nothing else.
+user gateway
+topic write factorysense/telemetry/#
+topic write factorysense/status/#
+
+# Telegraf ingestor: reads telemetry to store it in TimescaleDB.
+user ingestor
+topic read factorysense/telemetry/#
+
+# Rules engine: may read both raw readings and gateway alarm transitions.
+# Its application still needs to subscribe to status and implement cloud alert handling.
+user rules-engine
+topic read factorysense/telemetry/#
+topic read factorysense/status/#

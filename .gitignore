@@ -1,0 +1,14 @@
+# Secrets. .env is committed on purpose with demo values only (see README "Limits").
+config/mosquitto/certs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

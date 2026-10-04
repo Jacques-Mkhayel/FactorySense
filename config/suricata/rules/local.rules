@@ -1,0 +1,70 @@
+# ==============================================================================
+# FactorySense - Suricata IDS Ruleset
+# Data Tampering | Unauthorized Access | Data Leak | Service Unavailability
+# SIDs 1000001 - 1000017
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. DATA TAMPERING: PLC INTEGRITY & MODBUS ATTACKS
+# ------------------------------------------------------------------------------
+
+# 1.1 Modbus write attempt on read-only PLC (Unauthorized command / Tampering)
+alert modbus any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE ALERT: Modbus write attempt on read-only PLC [Data Tampering]"; modbus: access write; classtype:attempted-admin; priority:1; sid:1000002; rev:3;)
+
+# 1.2 Modbus diagnostic / restart function code (FC 08)
+alert modbus any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE ALERT: Modbus diagnostic/administrative function code 08"; modbus: function 8; classtype:attempted-admin; priority:1; sid:1000003; rev:1;)
+
+# 1.3 Modbus device identification / fingerprinting attempt (FC 43)
+alert modbus any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE ALERT: Modbus PLC fingerprinting probe (FC 43 Read Device ID)"; modbus: function 43; classtype:attempted-recon; priority:2; sid:1000011; rev:1;)
+
+# 1.4 Malformed Modbus request (register fuzzing / illegal addresses).
+# NOTE: "modbus: exception any" is not valid keyword syntax for this parser.
+# Detect protocol-anomaly events instead; verify the exact event name for your
+# Suricata 8.0 build with: suricata --list-app-layer-protos / --list-keywords=modbus
+alert modbus any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE ALERT: Malformed Modbus request (possible fuzzing)"; app-layer-event:modbus.invalid_length; classtype:bad-unknown; priority:2; sid:1000012; rev:2;)
+
+# ------------------------------------------------------------------------------
+# 2. UNAUTHORIZED ACCESS & TRUST BOUNDARY VIOLATIONS
+# ------------------------------------------------------------------------------
+
+# 2.1 Cloud-to-OT pivot: any inbound connection attempt from Cloud to Edge-Gateway
+alert tcp $CLOUD_NET any -> $PLANT_NET any (msg:"FACTORYSENSE CRITICAL: Cloud-to-OT inbound connection attempt [Boundary Pivot]"; flags:S; classtype:attempted-admin; priority:1; sid:1000013; rev:1;)
+
+# 2.2 Rogue device ICMP probing on plant floor
+alert icmp $PLANT_NET any -> any any (msg:"FACTORYSENSE ALERT: Rogue device ICMP probe on plant floor"; itype:8; classtype:attempted-recon; priority:2; sid:1000001; rev:2;)
+
+# 2.3 Rogue device port scan against plant floor / gateway
+alert tcp $PLANT_NET any -> any any (msg:"FACTORYSENSE ALERT: Rogue device TCP port scan detected"; flags:S; threshold:type both, track by_src, count 5, seconds 3; classtype:attempted-recon; priority:1; sid:1000004; rev:2;)
+
+# 2.4 Unauthorized administrative services (SSH / Telnet) on plant floor
+alert tcp any any -> $PLANT_NET [22,23] (msg:"FACTORYSENSE ALERT: Unauthorized SSH/Telnet connection attempt on OT network"; flags:S; classtype:policy-violation; priority:1; sid:1000014; rev:1;)
+
+# 2.5 Rogue IT device DNS query on isolated OT network
+alert udp $PLANT_NET any -> any 53 (msg:"FACTORYSENSE ALERT: Rogue device DNS query on isolated plant floor"; classtype:policy-violation; priority:2; sid:1000015; rev:1;)
+
+# ------------------------------------------------------------------------------
+# 3. DATA LEAK: UNENCRYPTED PLAINTEXT TRAFFIC
+# ------------------------------------------------------------------------------
+
+# 3.1 Plaintext MQTT connection attempt (port 1883) violating mandatory TLS.
+# Scoped to cloud_net to avoid false positives from unrelated dev tooling.
+alert tcp $CLOUD_NET any -> any 1883 (msg:"FACTORYSENSE ALERT: Plaintext MQTT connection attempt (TLS required) [Data Leak]"; flow:to_server; classtype:policy-violation; priority:1; sid:1000006; rev:2;)
+
+# 3.2 Direct outbound traffic from plant floor towards Internet.
+# Multicast and broadcast are link-local, not egress: the Docker host's bridge (.1) sends mDNS to
+# 224.0.0.251 on its own, which raised a critical false positive with plain $EXTERNAL_NET.
+alert ip $PLANT_NET any -> ![$HOME_NET,224.0.0.0/4,255.255.255.255] any (msg:"FACTORYSENSE ALERT: Plant floor egress attempt to external network"; classtype:policy-violation; priority:1; sid:1000007; rev:2;)
+
+# ------------------------------------------------------------------------------
+# 4. SERVICE UNAVAILABILITY: DENIAL OF SERVICE (DoS)
+# ------------------------------------------------------------------------------
+
+# 4.1 Modbus query flood (exceeding normal 1 Hz polling rate, see gateway POLL_INTERVAL_S)
+# flow/dsize make it a per-packet rule: without them Suricata treats it as "ip only" and
+# evaluates it once per connection, so a flood over one connection never reaches the count.
+alert tcp any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE ALERT: Modbus request flood on PLC [Denial of Service]"; flow:established,to_server; dsize:>0; threshold:type both, track by_dst, count 25, seconds 2; classtype:attempted-dos; priority:1; sid:1000016; rev:2;)
+
+# 4.2 TCP SYN flood attempt against the OT boundary.
+# Scoped to $PLANT_NET (not any->any) and thresholded for this stack's normal
+# traffic volume, not a generic Internet-facing default.
+alert tcp any any -> $PLANT_NET any (msg:"FACTORYSENSE ALERT: TCP SYN flood detected against OT boundary [Denial of Service]"; flags:S; threshold:type both, track by_dst, count 30, seconds 3; classtype:attempted-dos; priority:1; sid:1000017; rev:2;)
