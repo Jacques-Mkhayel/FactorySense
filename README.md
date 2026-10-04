@@ -1,717 +1,303 @@
 # FactorySense
 
-Industrial IoT monitoring prototype: machines on a plant floor stream vibration, temperature and
-pressure to a public cloud, which stores the telemetry, raises alerts and serves a dashboard.
-Built with Docker Compose as a hybrid edge/cloud architecture.
+Industrial IoT monitoring on a hybrid edge/cloud architecture. A simulated machine (PLC) produces
+temperature, pressure and vibration; an edge gateway reads it and sends the data to the cloud over
+MQTT/TLS; the cloud stores it, raises equipment and intrusion alerts, and shows them in a
+web dashboard. Everything runs with Docker Compose.
 
-> **Status: Phase 2 (implementation).** Every service is implemented. The simulator generates
-> normal/overheating measurements; the gateway reads them, checks local conditions, saves outgoing
-> messages to disk and replays them over MQTT/TLS; Mosquitto authenticates and queues; Telegraf
-> validates and stores telemetry with its original timestamps; the rules-engine raises equipment,
-> edge and IDS alerts; the API, dashboard and proxy serve them behind authentication and HTTPS.
+The goal was to build a small SIEM for the plant. Events from the network (Suricata) and from the
+machines (sensor thresholds, the gateway's own alarms) end up in one place. From there an analyst
+can see what is happening and respond to an incident by acknowledging it, following it and
+resolving it.
 
 ## Architecture
 
-Diagram: [`docs/architecture.mmd`](docs/architecture.mmd). Paste the whole file into
-[mermaid.live](https://mermaid.live) to view or export it.
+```mermaid
+flowchart LR
+  subgraph PLANT["Plant floor (plant_net, no internet)"]
+    SIM["simulator<br/>PLC, Modbus TCP"] -->|"Modbus read"| GW["edge-gateway<br/>72 h buffer, local alarms"]
+    IDS["ids<br/>Suricata"] -.- GW
+  end
+  subgraph CLOUD["Cloud (cloud_net)"]
+    MQ["mosquitto<br/>MQTT broker"] --> ING["ingestor<br/>Telegraf"]
+    MQ --> RE["rules-engine"]
+    ING --> DB[("timescaledb")]
+    RE --> DB
+    DB --> API["api x N<br/>FastAPI"]
+    API --> PX["proxy<br/>Traefik, HTTPS"]
+    FE["frontend<br/>dashboard"] --> PX
+  end
+  GW ==>|"MQTT/TLS 8883, outbound only"| MQ
+  IDS -.->|"eve.json"| RE
+  PX ==> U["Browser"]
+```
 
-Two Docker networks make the trust boundary real. `plant_net` is internal (no route to the cloud
-or the internet); `edge-gateway` is the only container on both networks, and it listens on no port.
+The edge gateway is the only container on both networks, and it opens no port: the plant only
+connects outward. A more detailed diagram is in [`docs/architecture.mmd`](docs/architecture.mmd).
 
-| Service | Role | Built with |
+| Service | What it does | Technology |
 |---|---|---|
-| `simulator` | Fake PLC exposing sensor registers over Modbus TCP | Python, pymodbus |
-| `edge-gateway` | Reads the PLC, buffers up to 72h on WAN loss, publishes outbound over MQTT/TLS | Python, pymodbus |
-| `ids` | Network IDS on the gateway's interfaces (shares its network namespace) | Suricata |
-| `mosquitto` | MQTT broker: TLS only, one user per client, topic ACL | Eclipse Mosquitto |
-| `ingestor` | Validates MQTT readings and stores them in TimescaleDB | Telegraf + Starlark |
-| `timescaledb` | Single database: telemetry hypertable + hourly rollup, and relational data | PostgreSQL + TimescaleDB |
-| `rules-engine` | Detects anomalies and manages alerts (equipment and IDS) | Python |
-| `api` | Login, alerts, telemetry and user management (REST) + live alerts (WebSocket); stateless, horizontally scalable | FastAPI, psycopg 3 |
-| `frontend` | Mini SIEM dashboard: alert feed, KPIs, telemetry charts, user admin | Static HTML/CSS/JS on nginx |
-| `proxy` | Single public entry point and security layer (TLS, CSP, rate limits); load-balances `api` replicas | Traefik |
-
-`mqtt-certs` is a Compose service that runs as a one-shot job: it creates the broker's TLS
-certificate on first start, validates existing material on subsequent runs, and exits.
-
-## Simulator register map
-
-The simulator exposes the following Modbus input registers. These are the addresses the
-edge gateway will use when reading measurements; TCP port `502` is the connection port,
-not a register address.
-
-| Register address | Measurement | Unit | Encoding | Resolution | Example |
-|---|---|---|---|---|---|
-| `0` | Temperature | °C | Multiply by 10, signed 16-bit | 0.1 °C | 71.5 → `715`; −5.2 → `65484` |
-| `1` | Pressure | bar | Multiply by 100 | 0.01 bar | 4.25 → `425` |
-| `2` | Vibration velocity magnitude | mm/s | Multiply by 100 | 0.01 mm/s | 0.83 → `83` |
-| `3`–`15` | Reserved | — | — | — | — |
-
-Each measurement uses one 16-bit register, transferred as a raw integer from `0` to `65535`.
-The simulator multiplies by the scale and rounds to the nearest integer using Python's
-`round` (ties to even). Extra decimal precision is lost during encoding.
-
-Temperature interprets those bits as a **signed** integer from `-32768` to `32767`, using
-two's complement. To encode a negative scaled integer, add `65536`: −5.2 °C becomes −52,
-then raw register value `65484`. To decode temperature, subtract `65536` if the raw value
-is at least `32768`, then divide by 10. Positive temperatures keep their usual encoding.
-Pressure and vibration remain **unsigned**: decode them by dividing the raw value by 100.
-The gateway must apply these same rules before publishing physical values as JSON.
-
-The encoding ranges are −3276.8–3276.7 °C, 0–655.35 bar and 0–655.35 mm/s; these are storage
-limits, not realistic operating ranges or alarm thresholds. Vibration represents a
-velocity magnitude, not a signed waveform. Non-finite and out-of-range physical values
-are rejected; negative pressure and vibration are also rejected.
-
-`INPUT_REGISTER_MAP`, `MEASUREMENT_UNITS`, `REGISTER_SCALES` and `REGISTER_SIGNED` in
-`services/simulator/src/main.py` define this contract. `encode_measurement` and
-`decode_measurement` implement the conversions. The simulator fills sensor registers before
-accepting connections and refreshes them approximately once per second. Reserved registers
-`3`–`15` remain at zero.
-
-## Simulator measurement generation
-
-`generate_measurements(elapsed_s, rng=None, scenario="normal")` in `services/simulator/src/main.py` returns
-one dictionary containing temperature, pressure and vibration in their physical units.
-Each value is calculated as **baseline + smooth cyclic variation + bounded random noise**.
-The cycle is a sine wave; its period is the time taken to complete one repetition.
-
-| Measurement | Baseline | Cyclic variation | Period | Random noise | Possible range |
-|---|---|---|---|---|---|
-| Temperature | 70 °C | ±2 °C | 120 s | ±0.2 °C | 67.8–72.2 °C |
-| Pressure | 4.2 bar | ±0.15 bar | 30 s | ±0.02 bar | 4.03–4.37 bar |
-| Vibration velocity magnitude | 0.8 mm/s | ±0.1 mm/s | 10 s | ±0.02 mm/s | 0.68–0.92 mm/s |
-
-These settings in `SIMULATION_PROFILES` illustrate normal operation; they are not real
-machine specifications or alarm thresholds. Signed temperature encoding remains supported,
-although this normal-operation profile generates positive temperatures.
-
-`elapsed_s` means seconds since the simulation started, not a Unix timestamp. The
-update loop obtains it from a monotonic clock, unaffected by wall-clock corrections. Passing a seeded `random.Random`
-instance makes a sequence repeatable when called with the same elapsed times.
-The generator returns unrounded physical values; `encode_measurement` handles rounding
-when storing them. The optional overheating scenario is described below.
-
-`run_simulator()` starts the Modbus server and calls `update_registers()` approximately
-every `UPDATE_INTERVAL_S` seconds (currently `1.0`). Each update generates a sample,
-encodes its three values, and writes addresses `0`–`2` together through the server's
-`async_setValues` API. This is an internal update of input registers, not a client write.
-`await asyncio.sleep(...)` allows the server to keep handling reads between updates.
-The server is closed in a `finally` block when the update loop ends.
-
-To rebuild and run the updated simulator:
-
-```bash
-docker compose up -d --build --no-deps simulator
-```
-
-With the gateway container running, read the simulator three times (raw encoded values):
-
-```bash
-docker compose exec -T edge-gateway python - <<'PY'
-import time
-from pymodbus.client import ModbusTcpClient
-
-with ModbusTcpClient("simulator", port=502) as client:
-    for _ in range(3):
-        response = client.read_input_registers(0, count=3, device_id=1)
-        if response.isError():
-            raise RuntimeError(response)
-        print(response.registers)  # [temperature x10, pressure x100, vibration x100]
-        time.sleep(1.2)
-PY
-```
-
-For negative temperatures, apply the signed decoding rule above. Small changes may
-round to the same register value in consecutive samples.
-
-## Simulator overheating scenario
-
-Choose the simulator mode with `SIMULATION_SCENARIO` in `.env`:
-
-- `normal` (default): use the normal measurement profiles above.
-- `overheating`: add a gradual temperature rise, while pressure and vibration keep their
-  normal behaviour. Any other value causes startup to fail with a configuration error.
-
-The overheating timeline starts each time the simulator process starts:
-
-| Elapsed time | Behaviour |
-|---|---|
-| 0–30 seconds | Normal readings |
-| 30–90 seconds | Add 0.5 °C per second since the 30-second mark |
-| 90 seconds onward | Keep the added temperature at +30 °C |
-
-The offset is added to the usual temperature cycle and noise. At 60 seconds the offset
-is +15 °C (temperature around 85 °C); after 90 seconds the temperature stays within
-97.8–102.2 °C. Small sample-to-sample fluctuations can still occur. The cap limits the
-extra temperature, not the total reading, and prevents an endlessly increasing value.
-The timing, rate and cap are named `OVERHEATING_*` constants in the simulator code.
-
-For a demonstration, rebuild and recreate only the simulator with the selected mode:
-
-```bash
-SIMULATION_SCENARIO=overheating docker compose up -d --build --no-deps simulator
-```
-
-Use the Modbus read example above to observe register `0` (divide its value by 10 for
-these positive temperatures). Repeat reads over at least 90 seconds to see the ramp
-and plateau. To return to normal operation:
-
-```bash
-SIMULATION_SCENARIO=normal docker compose up -d --no-deps simulator
-```
-
-These shell overrides select the mode for that Compose command; they do not edit `.env`.
-Set `SIMULATION_SCENARIO=overheating` in `.env` instead to persist the choice. To replay the
-ramp while already in overheating mode, use `docker compose restart simulator`.
-A plain restart resets the timeline but does not load changed environment settings;
-use `docker compose up -d --no-deps simulator` after editing `.env`.
-
-A future rule such as "temperature > 85 °C" can use this scenario to demonstrate alert
-creation. That is an illustrative threshold, not an implemented rule or an equipment
-safety limit. The simulator only produces measurements; the gateway/rules engine will
-perform detection later.
-
-## Gateway collection and connection recovery
-
-The gateway reads input registers `0`–`2` from `simulator:502`, device ID `1`. It decodes
-temperature as a signed 16-bit integer divided by 10, and pressure/vibration as unsigned
-integers divided by 100. For example `[65484, 425, 83]` means −5.2 °C, 4.25 bar, 0.83 mm/s.
-Invalid or incomplete responses produce no reading; previous data or zeros are not substituted.
-
-`POLL_INTERVAL_S` defaults to 1 second. After a failed Modbus attempt, retries wait 1, 2,
-4, … seconds up to 30 seconds (starting at the polling interval if it exceeds 1 second).
-Successful reads reset the retry delay. Each network attempt has a 3-second timeout.
-MQTT reconnects independently with increasing delays capped at 30 seconds. A PLC outage
-does not stop replaying saved messages; a broker outage does not stop collecting readings
-or evaluating local checks. Measurements cannot be recovered for times when the PLC itself
-was unavailable.
-
-The loopback `/health` endpoint returns connection flags, pending-message count,
-`last_sample_ts`, local alarm state and worker errors. During PLC/broker outages it returns
-HTTP 200 with `status=degraded`: the gateway is alive and attempting recovery. `status=ok`
-means both connections are up, not that every downstream service processed the data.
-An unrecoverable replay-worker error is exposed and makes the gateway exit for Docker to
-restart it. SQLite write failures also terminate the process instead of silently dropping
-new data. Pending committed data is retained. SIGTERM/SIGINT stop polling and replay and
-close SQLite and network clients cleanly.
-
-## Gateway telemetry and secure MQTT
-
-Each successful read produces a JSON message such as:
-
-```json
-{
-  "ts": 1790000000000,
-  "site_id": "plant-01",
-  "machine_id": "press-01",
-  "temperature": -5.2,
-  "pressure": 4.25,
-  "vibration": 0.83
-}
-```
-
-`ts` is gateway collection time in Unix milliseconds, captured immediately after the
-Modbus read. It is not the PLC's generation time: the register map contains no timestamp.
-The JSON and its original `ts` are saved unchanged and replayed unchanged. `SITE_ID` and
-`MACHINE_ID` come from Compose/`.env` (defaults `plant-01` / `press-01`). They must be
-nonempty and cannot contain `/`, `+`, `#` or null characters.
-
-The telemetry topic is `factorysense/telemetry/<site>/<machine>`. MQTT uses QoS 1 and
-`retain=false`. `paho-mqtt==2.1.0` handles the network on a background thread. The configured
-CA (`MQTT_CA_FILE=/certs/ca.crt`) must validate the broker certificate and its hostname
-(`MQTT_HOST=mosquitto`). TLS 1.2 is the minimum version; `MQTT_PORT=8883` is the default.
-`MQTT_USER=gateway` and `MQTT_PASSWORD` (from `.env`'s `MQTT_GATEWAY_PASSWORD`) authenticate
-the client. The password is never included in the logged configuration. Missing credentials
-or invalid CA configuration fail startup; there is no insecure fallback.
-
-The client ID is `factorysense-gateway-<site>-<machine>`: use one running gateway per
-site/machine pair, each with its own buffer. The health endpoint is only on loopback;
-the gateway exposes no application listener to either Docker network.
-
-## Persistent buffer and replay
-
-Every sample is written to SQLite **before publishing**, even when MQTT is connected.
-`BUFFER_PATH=/var/lib/gateway/buffer.db` is stored in the existing `gateway-buffer` Docker
-volume. SQLite transactions, WAL and full synchronization keep committed samples across
-process/container restarts. Do not delete that volume if you want to preserve pending data.
-A single gateway process owns a buffer; multiple replicas sharing it are not supported.
-
-An independent replay worker sends the oldest pending message first, one at a time. It
-removes that specific row only after a matching QoS 1 broker acknowledgement. Callback
-acknowledgements are passed through a thread-safe queue, so even an acknowledgement that
-arrives before `publish()` returns is handled. Paho's in-memory queue is limited to one
-message; SQLite owns the backlog.
-
-If an acknowledgement is missing for `MQTT_ACK_TIMEOUT_S` (default 30 seconds), the worker
-retires the old MQTT client and its memory queue, creates a fresh client, and retries the
-saved row. Fresh acknowledgement queues prevent old message IDs deleting a different row.
-Collection continues independently during replay, reconnection and acknowledgement waits.
-
-Pending messages older than `GATEWAY_BUFFER_RETENTION_H` (default 72 hours) are deleted,
-with a `buffer_expired` warning containing the count. Retention is based on original
-collection time and is enforced even while MQTT is down. This intentionally bounds the
-age of pending data; disk capacity must still accommodate the configured sampling rate.
-SQLite reuses freed space; deleting rows need not immediately shrink the file.
-
-Delivery is **at least once**, not exactly once. A crash after the broker receives a message
-but before SQLite records its acknowledgement can produce a duplicate on replay. The
-original payload and timestamp remain identical. The current telemetry table does not
-deduplicate these automatically. A PUBACK confirms the broker handshake, not a database
-insert, and MQTT 3.1.1 cannot report every topic-ACL rejection through that acknowledgement.
-
-Useful logs:
-
-- `telemetry_buffered`: the reading has been committed locally.
-- `mqtt_connected` / `mqtt_connection_failed` / `mqtt_connection_rejected`: connection state.
-- `mqtt_publish_queued`: a durable row has been submitted to Paho.
-- `mqtt_publish_acknowledged`: the broker handshake completed.
-- `buffer_delivered`: the matching durable row was deleted after acknowledgement.
-- `mqtt_delivery_retry`: the acknowledgement deadline expired or the pending row expired.
-- `buffer_expired`: retention intentionally removed old pending messages.
-- `modbus_read_failed` / `modbus_recovered`: PLC connection recovery.
-
-## Local calculations and overheating detection
-
-`local_checks.py` processes fresh samples without needing the broker or database. Over a
-rolling `LOCAL_WINDOW_S` window (default 60 seconds), it calculates the sample-based mean
-temperature, mean pressure, and maximum vibration magnitude. These are logged as
-`local_features`; they are not additional telemetry columns. The window holds at most
-10,000 samples, resets after process restart, and excludes expired samples after a PLC
-outage. It is not a time-weighted average or vibration waveform/RMS calculation.
-
-The first local rule is configurable demo overheating:
-
-- Trigger immediately when the current temperature is **at least 85 °C**
-  (`LOCAL_TEMP_CRITICAL_C`), without waiting for a rolling average.
-- Remain active until a fresh reading is **below 80 °C** (`LOCAL_TEMP_CLEAR_C`).
-- Emit one activation and one resolution event per episode, rather than repeated alarms
-  on every hot sample. The separate clear threshold prevents repeated toggling near 85 °C.
-- Persist the alarm state with its transition event in the same transaction. A restart
-  while hot does not emit a duplicate activation. Missing readings do not clear an alarm;
-  consult `last_sample_ts` and `modbus_connected` to distinguish fresh and stale state.
-
-The thresholds are illustrative, not real equipment safety limits. They are not used to
-control or shut down the PLC. Pressure and vibration are calculated/reported but currently
-have no local alarm thresholds.
-
-Transitions are logged immediately as `local_alert` and buffered for QoS 1 publication to
-`factorysense/status/<site>/<machine>`, an already-allowed gateway topic. The event includes
-its original timestamp, source IDs, `rule=overheating`, `state=active|resolved`, severity,
-temperature, thresholds and recent features. Alert state and queued events survive outages
-and restarts. Status events use the same retention policy as telemetry.
-
-Telegraf subscribes to telemetry only. The rules-engine subscribes to both topics: each
-`active` status event opens an **"Edge local alarm: overheating"** alert in the dashboard (source
-`equipment`, `details.origin = edge-gateway`, with the original measurement time) and the matching
-`resolved` event closes it. Because the decision is taken at the edge, the alarm is raised even
-during a WAN outage and reaches the dashboard when the gateway replays its buffer. Like Telegraf,
-the rules-engine keeps a persistent MQTT session, so the broker queues that replay (up to its
-default 1000 messages) even if the gateway reconnects before the rules-engine does. The raw
-temperature still reaches telemetry, so the cloud rules detect overheating independently too.
-
-## Running and verifying the gateway
-
-The code is split into `main.py` (collection, MQTT setup and health), `outbox.py` (durable
-storage), `publisher.py` (replay worker), and `local_checks.py` (calculations/rules).
-New settings are documented in `.env`; Compose supplies defaults if a local `.env` lacks them. Rebuild the services, including `ids` because it shares the gateway's network
-namespace:
-
-```bash
-docker compose up -d --build --wait simulator mosquitto edge-gateway ids
-docker compose logs --tail=30 -f edge-gateway
-```
-
-Inspect health, including the number of pending telemetry and status messages:
-
-```bash
-docker compose exec edge-gateway python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health').read().decode())"
-```
-
-For an outage demonstration, stop Mosquitto, let the gateway collect readings, inspect the
-pending count, then start Mosquitto again. Restarting the gateway while offline also keeps
-pending data. Recreating the gateway requires recreating `ids` with it.
-
-```bash
-docker compose stop mosquitto
-# Wait for several readings; inspect gateway logs/health.
-docker compose start mosquitto
-# Pending count falls as the broker acknowledges replayed messages.
-```
-
-Use the simulator's overheating mode to exercise local alerts even while MQTT is down.
-For storage verification, allow Telegraf its 5-second flush interval, then use your configured
-database credentials (the following uses the Compose-provided ones inside the container):
-
-```bash
-docker compose exec timescaledb sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT time, site_id, machine_id, temperature FROM telemetry ORDER BY time DESC LIMIT 10;"'
-```
-
-Run the automated regression suite with the gateway's dependencies:
-
-```bash
-docker compose run --rm --no-deps -T -v "$PWD/services/edge-gateway:/work/gateway:ro" --entrypoint python edge-gateway -m unittest discover -s /work/gateway/tests -v
-```
-
-`services/edge-gateway/tests/integration_replay.py` is an explicit integration test for the
-actual process, SQLite crash recovery, TLS/MQTT replay, and local alarm recovery. It uses
-a temporary buffer/test PLC and uniquely labelled `replay-test-*` messages. It requires
-the ingestor password in `MQTT_TEST_SUBSCRIBER_PASSWORD` for its temporary subscriber.
-
-## Mosquitto broker
-
-Mosquitto is the running MQTT service supplied by the `eclipse-mosquitto:2.1-alpine` image.
-There is no custom broker `main.py`. The gateway sends messages to a **topic** (a routing
-address), and Mosquitto forwards them to clients allowed to subscribe to that topic.
-For example, a reading on `factorysense/telemetry/plant-01/press-01` reaches Telegraf.
-The broker forwards the payload unchanged, including the original `ts`; it does not decode
-registers, calculate temperatures, or evaluate the overheating threshold.
-
-The implementation is configuration plus two startup scripts:
-
-| File | Responsibility |
-|---|---|
-| `docker-compose.yml` | Runs the broker, attaches `cloud_net`, mounts certificates/data, supplies credentials and checks health. |
-| `config/mosquitto/mosquitto.conf` | TLS listener, password/ACL paths, persistence and logs. |
-| `config/mosquitto/acl` | Defines which topics each account may publish to or read. |
-| `config/mosquitto/entrypoint.sh` | Requires all three passwords, builds a hashed password file, protects runtime files, then starts Mosquitto. |
-| `config/mosquitto/gen-certs.sh` | Creates the prototype CA/server certificate or validates an existing complete set. |
-
-### Secure connections and permissions
-
-Clients use TLS on **8883** and verify the broker's certificate against the shared CA and
-its DNS name, `mosquitto`. They then authenticate with their own username/password from
-`.env`. This is server-certificate TLS with password authentication; clients do not need
-individual certificates. The broker has no host-published port or network plaintext MQTT
-listener. Its anonymous **1880** listener binds only to container loopback for the uptime
-healthcheck; anonymous access permits reading `$SYS/broker/uptime` only. That healthcheck
-checks local broker liveness; the integration tests below separately verify TLS/authentication.
-
-| Account | May publish | May read |
-|---|---|---|
-| `gateway` | `factorysense/telemetry/#`, `factorysense/status/#` | Nothing |
-| `ingestor` | Nothing | `factorysense/telemetry/#` |
-| `rules-engine` | Nothing | `factorysense/telemetry/#`, `factorysense/status/#` |
-
-`#` means all topic levels below that prefix. Other operations are denied. Accounts are
-shared service roles in this prototype, not separate identities per machine. Permission to
-read status prepares the rules engine to receive gateway overheating transitions; cloud
-alert processing is still unfinished.
-
-Startup rejects missing/empty passwords. Runtime key/hash files use mode `0600`, inside a
-`0700` directory owned by Mosquitto. Certificate bootstrap refuses incomplete material,
-a certificate that fails CA/expiry/hostname verification, or a mismatched private key,
-instead of silently replacing a CA that existing clients may still trust. The prototype
-certificate lifetime is one year; renewal is manual.
-
-### Queues and restart recovery
-
-Broker state is saved in the `mosquitto-data` volume every **30 seconds** and on clean
-shutdown. This preserves subscriptions and queued QoS 1/2 messages for persistent sessions,
-and retained messages if clients use them. Telegraf already requests a persistent session
-with a stable client ID. A subscriber must first connect and establish its subscription;
-Mosquitto does not reconstruct messages sent before that subscription existed.
-
-There are three different storage responsibilities:
-
-- **Gateway SQLite buffer:** readings waiting to be acknowledged by the broker, including
-  while the broker/network is unavailable.
-- **Broker persistence:** MQTT session/queued-message state, including while an established
-  persistent subscriber is offline. Queue limits still apply (Mosquitto's default is 1,000
-  queued QoS 1/2 messages per client).
-- **TimescaleDB:** measurement history after ingestion.
-
-A broker acknowledgement is not confirmation of a database insert. An abrupt broker crash
-can lose changes since the last persistence save; QoS 1 can also produce duplicates. The
-30-second checkpoint is not a guarantee of lossless delivery or unlimited offline storage.
-See the [official Mosquitto configuration reference](https://mosquitto.org/man/mosquitto-conf-5.html)
-for persistence, queue limits and ACL behavior.
-
-### Verify the broker
-
-With Docker running and the gateway image built (it supplies the test client's Python/Paho):
-
-```bash
-docker compose build edge-gateway
-python3 config/mosquitto/tests/run.py
-```
-
-The test creates a separate broker, internal network, certificate/data volumes and disposable
-credentials, then removes them. It checks certificate creation/reuse and invalid material,
-missing credentials, runtime file permissions, TLS verification, authentication, all three
-roles' allowed/denied topic operations, unchanged JSON delivery, and a persistent subscriber's
-queued message across a clean broker restart. Existing project containers/data are untouched.
-It does not test sudden power loss or full database/dashboard delivery.
-
-To apply the configuration to an existing stack, rerun certificate validation, then recreate
-the broker so it regenerates its password/ACL runtime files and loads the updated settings:
-
-```bash
-docker compose run --rm --no-deps mqtt-certs
-docker compose up -d --no-deps --force-recreate --wait mosquitto
-docker compose logs --tail=30 mosquitto
-```
-
-This briefly interrupts broker connections; the implemented gateway reconnects and replays
-its buffer. The named volumes are preserved. Changing `.env` passwords also requires
-recreating the affected clients so their credentials match.
-
-## Ingestor: MQTT readings into TimescaleDB
-
-The `ingestor` service runs Telegraf from its Docker image. Its configuration is
-`config/telegraf/telegraf.conf`; a small script, `config/telegraf/telemetry.star`, runs inside
-Telegraf to validate and map each message. Starlark resembles Python, but it is not a
-separate Python service. The path is:
-
-```text
-Mosquitto telemetry topic -> Telegraf validation -> telemetry table in TimescaleDB
-```
-
-### Message contract and database mapping
-
-The input subscribes to `factorysense/telemetry/#` using the ingestor's MQTT credentials,
-verified TLS, QoS 1 and the stable persistent client ID `factorysense-ingestor`. There must
-be only one active instance with that ID. Status/overheating events are handled separately
-by the future rules engine; they are not measurement rows.
-
-Each message must be a JSON object with all six fields:
-
-| JSON field | Database column | Meaning |
-|---|---|---|
-| `ts` | `time` (`timestamptz`) | Original gateway collection time, Unix milliseconds |
-| `site_id` | `site_id` (`text`) | Plant identifier |
-| `machine_id` | `machine_id` (`text`) | Machine identifier |
-| `temperature` | `temperature` (`double precision`) | Degrees Celsius, including negative temperatures |
-| `pressure` | `pressure` (`double precision`) | Bar |
-| `vibration` | `vibration` (`double precision`) | Millimetres per second |
-
-Validation requires nonempty string identifiers that match the MQTT topic exactly. The
-sensor values must be JSON numbers, not strings, booleans, nulls or arrays. They must fit
-the agreed register encoding: temperature -3276.8..3276.7, pressure/vibration 0..655.35.
-These are encoding limits, not alarm thresholds: a 90 °C overheating reading is accepted.
-`ts` must be a positive integer that fits Telegraf's nanosecond timestamp representation;
-missing/invalid timestamps are never replaced with arrival time. Replayed old readings
-keep their original time. Existing database retention still applies to backfilled data.
-
-Invalid messages are logged as `Rejected telemetry` and deliberately dropped/acknowledged,
-so they do not repeatedly block valid readings. They are not stored in a quarantine table.
-Extra JSON keys are ignored. The processor keeps only the three sensor fields and two ID
-tags, then converts milliseconds to Telegraf nanoseconds. It modifies the existing metric
-so MQTT delivery tracking is preserved.
-
-The PostgreSQL output targets the existing `public.telemetry` hypertable. Automatic table
-and column creation are disabled; schema changes belong in database initialization or an
-explicit migration. Existing data requires no migration for this implementation.
-
-### Delivery and recovery
-
-Telegraf flushes a batch every 5 seconds, or when 100 readings accumulate. The output
-buffer holds up to 10,000 metrics in memory, while MQTT limits delivery to 500 pending
-messages. Failed database writes are retried. The MQTT input tracks delivery through the
-outputs before acknowledging accepted readings; a persistent broker session can therefore
-redeliver unacknowledged readings following an ingestor interruption. Invalid messages
-are intentionally acknowledged after rejection. MQTT reconnect delay is capped at 30 seconds.
-See the [Telegraf MQTT input documentation](https://github.com/influxdata/telegraf/tree/v1.40.0/plugins/inputs/mqtt_consumer).
-
-Delivery is **at least once**, not exactly once: retries may create duplicate rows. This
-implementation does not deduplicate them. Broker queue limits and persistence checkpoints
-still apply; the Telegraf memory buffer is not a separate durable disk queue. The local
-HTTP endpoint on `127.0.0.1:8080` reports process liveness, not database connectivity or
-proof that recent readings were stored.
-
-Compose passes `PGHOST`, `PGDATABASE`, `PGUSER` and `PGPASSWORD` directly to the PostgreSQL
-driver, so passwords with spaces/quotes do not need connection-string escaping. The
-prototype still uses the configured database owner and unencrypted database traffic on
-`cloud_net`; a dedicated restricted database role remains future hardening work. MQTT
-continues to use the separate read-only ingestor account and verified TLS.
-
-### Run and verify ingestion
-
-Apply the service configuration without rebuilding an image:
-
-```bash
-docker compose up -d --no-deps --force-recreate --wait ingestor
-docker compose logs --tail=30 -f ingestor
-```
-
-Verify actual inserts (allow at least one 5-second flush):
-
-```bash
-docker compose exec timescaledb sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT time, site_id, machine_id, temperature, pressure, vibration FROM telemetry ORDER BY time DESC LIMIT 10;"'
-```
-
-Run repeatable integration checks:
-
-```bash
-python3 config/telegraf/tests/run.py
-```
-
-The test runs separate Mosquitto, Telegraf and TimescaleDB containers on an isolated network
-with disposable credentials/volumes. It checks exact values and a timestamp from 48 hours
-earlier, 21 malformed messages, extra-field filtering, permitted overheating data, ingestion
-after an offline subscription, and recovery after a database outage plus an ingestor crash.
-It also tests a database password containing spaces and a quote. All temporary containers,
-volumes and the network are removed; existing project services/data are untouched.
+| `simulator` | Fake PLC with three sensor registers; normal mode or a fault scenario (overheating, vibration, pressure) | Python, pymodbus |
+| `edge-gateway` | Reads the PLC every second, runs a local overheating alarm, stores every message in SQLite and replays it when the broker is reachable | Python, paho-mqtt, SQLite |
+| `ids` | Network IDS on the gateway's interfaces (Modbus writes, scans, probes, floods) | Suricata |
+| `mosquitto` | MQTT broker: TLS only, one account per service, topic ACL | Mosquitto |
+| `ingestor` | Validates each reading and inserts it with its original timestamp | Telegraf + Starlark |
+| `timescaledb` | Telemetry hypertable with hourly rollup (30 d raw, 365 d rollup), alerts, users | PostgreSQL + TimescaleDB |
+| `rules-engine` | Turns telemetry, gateway alarms and IDS events into alerts | Python |
+| `api` | REST + WebSocket for alerts, telemetry and users; stateless, scalable | FastAPI |
+| `frontend` | Dashboard: live alert feed, KPIs, charts, user admin | HTML/CSS/JS on nginx |
+| `proxy` | Single public entry point: HTTPS, security headers, rate limits, load balancing | Traefik |
 
 ## Quick start
 
-Requirements: Docker with Compose v2, and ports 80 and 443 free (see Troubleshooting otherwise).
+Requirements: Docker with Compose v2, ports 80 and 443 free.
 
 ```bash
-docker compose up -d --build --wait   # .env ships with demo values; edit it for anything real
-docker compose ps             # 10 services "healthy", mqtt-certs "Exited (0)"
+docker compose up -d --build --wait
+docker compose ps        # 10 services healthy; mqtt-certs "Exited (0)" is expected
 ```
 
-Open https://localhost and accept the self-signed certificate warning (http:// redirects there).
-Sign in with `ADMIN_USERNAME` / `ADMIN_PASSWORD` from `.env`; create more users in the **Users** tab.
-API docs: https://localhost/api/docs.
+Open https://localhost, accept the self-signed certificate and sign in as administrator:
 
-Stop with `docker compose down` (keeps data) or `docker compose down -v` (full reset, also
-regenerates certificates and re-runs database init).
+| User | Password |
+|---|---|
+| `admin` | `change-me-admin-password` |
 
-## Try it
+These are the demo values of `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`. More users can be created
+in the **Users** tab. API docs: https://localhost/api/docs.
 
-Run these from the repository root with the stack up.
+`docker compose down` stops the stack and keeps the data; `docker compose down -v` resets everything.
 
-**Send a reading through the whole pipeline** (MQTT/TLS → Telegraf → TimescaleDB). The ingestor
-only stores complete readings: `ts`, `site_id`, `machine_id` and all three numeric measurements.
+## Demos
+
+All commands run from the repository root with the stack up.
+
+**1. Machine failures.** See [Simulate failures](#simulate-failures): the PLC goes out of range
+(temperature, vibration, pressure) or goes offline, and the SIEM raises an alert.
+
+**2. WAN outage, no data loss.** Stop the broker: the gateway keeps reading and buffering. When the
+broker comes back, the backlog is replayed and stored with the original timestamps.
 
 ```bash
-source .env
-docker run --rm --network factorysense_cloud_net -v factorysense_mqtt-tls-ca:/certs:ro \
-  eclipse-mosquitto:2.1-alpine mosquitto_pub -h mosquitto -p 8883 --cafile /certs/ca.crt \
-  -u gateway -P "$MQTT_GATEWAY_PASSWORD" -q 1 -t factorysense/telemetry/plant-01/press-01 \
-  -m "{\"ts\":$(date +%s000),\"site_id\":\"plant-01\",\"machine_id\":\"press-01\",\"temperature\":71.5,\"pressure\":4.2,\"vibration\":0.8}"
-sleep 5   # Telegraf writes every 5 s
-docker compose exec timescaledb psql -U factorysense -c "SELECT * FROM telemetry ORDER BY time DESC LIMIT 5;"
+docker compose stop mosquitto
+docker compose ps edge-gateway     # still healthy
+docker compose start mosquitto
 ```
 
-**Network isolation**: the PLC cannot reach the cloud (fails with a name resolution error).
+**3. Attacks on the plant.** See [Simulate attacks](#simulate-attacks): nine commands, each one
+raising an alert in the SIEM.
+
+**4. Network isolation.** The PLC cannot reach the cloud (name resolution fails).
 
 ```bash
 docker compose exec simulator python -c "import socket; socket.create_connection(('mosquitto', 8883), timeout=2)"
 ```
 
-**Horizontal scaling**: Traefik spreads requests across three API replicas.
+**5. Horizontal scaling.** Traefik spreads requests over three API replicas; the `replica` field
+changes between responses and the session survives because it is stored in the database.
 
 ```bash
-docker compose up -d --scale api=3 --wait
-sleep 5   # give Traefik time to register the new replicas
-for i in $(seq 9); do curl -sk https://localhost/api/health; echo; done   # "replica" changes
+docker compose up -d --scale api=3 --wait && sleep 5
+for i in $(seq 6); do curl -sk https://localhost/api/health; echo; done
 docker compose up -d --scale api=1
 ```
 
-The dashboard shows the replica that answered last in the top bar (sessions live in the database,
-so you stay signed in whichever replica answers).
+## Design decisions
 
-**Intrusion detection**: a rogue device pings the gateway, then the gateway writes to the
-read-only PLC. Both raise Suricata alerts, which appear live in the dashboard with source `ids`.
+- **Store, then send.** The gateway writes every reading to SQLite before publishing and deletes it
+  only after the broker acknowledges it (QoS 1). Up to 72 h survive a WAN outage or a restart.
+  Delivery is at least once, so duplicates are possible.
+- **Time comes from the edge.** Each message carries `ts` (collection time). Data replayed after an
+  outage is stored, and its alerts are dated, when it was measured, not when it arrived.
+- **Detection in two places.** The gateway raises its overheating alarm without the cloud (≥ 85 °C,
+  clears < 80 °C), so it works offline and arrives on replay. The cloud rules check temperature,
+  vibration and pressure independently, plus sensor silence (no data for 10 s).
+- **Hysteresis.** Alerts open at one threshold and close at a lower one, so a value hovering at the
+  limit keeps a single alert open instead of flapping every second.
+
+| Metric | Warning | Critical | Resolves when |
+|---|---|---|---|
+| Temperature | 75 °C | 85 °C | < 73 °C |
+| Vibration | 4 mm/s | 6 mm/s | < 3.5 mm/s |
+| Pressure | — | outside 3.5–5.0 bar | back within 3.7–4.8 bar |
+
+- **Live dashboard without polling.** A database trigger sends `NOTIFY` on every alert change; each
+  API replica `LISTEN`s and pushes it over WebSocket.
+
+## Security
+
+**Encryption.** Traffic is encrypted wherever it crosses a trust boundary:
+
+- **Plant → cloud:** the gateway publishes over MQTT/TLS (8883) and checks the broker's certificate.
+  The ingestor and rules engine also read from the broker over TLS.
+- **Users → website:** HTTPS through Traefik; plain HTTP only redirects to HTTPS.
+
+Inside `cloud_net` (proxy → API and dashboard, services → database), traffic is plain HTTP and
+plain PostgreSQL. This is a deliberate trust assumption: the internal cloud network is private and
+only the cloud provider can access it. The plant link from the PLC to the gateway (Modbus) is not
+encrypted either, because the protocol does not support it. It stays on the isolated plant network,
+and Suricata watches it.
+
+**Other controls:**
+
+- **Network:** the plant network is internal; the gateway only connects outward and listens on no port.
+- **MQTT:** TLS 1.2+ with certificate verification, a password per service, and an ACL (the gateway
+  can only publish, the ingestor and rules engine can only read).
+- **Web:** HTTPS only, strict CSP and security headers, rate limit of 5 logins/min per IP.
+- **Accounts:** scrypt password hashes, server-side sessions in an `HttpOnly`, `Secure`,
+  `SameSite=Strict` cookie, admin-only user creation.
+- **Database:** the API uses a least-privilege role that can only change an alert's status fields.
+- **IDS:** Suricata watches the plant network (see below).
+
+## SIEM and intrusion detection
+
+The dashboard works as a mini SIEM. It has one live feed for equipment alerts (source `equipment`)
+and network alerts (source `ids`), with KPIs and filters by source, severity and status. The response
+workflow is: an alert opens as **active**, an analyst **acknowledges** it (their name and the time are
+recorded), and it is **resolved** by hand or automatically when the reading returns to normal.
+
+Network events come from Suricata. It shares the gateway's network namespace, so it sees every
+packet entering or leaving the plant on both networks. Its alerts go to `eve.json`; the rules engine
+reads that file and turns each one into a SIEM alert. Suricata priority 1 becomes **critical**,
+priority 2 **warning**. Repeated hits of the same rule between the same two hosts update one alert
+and increase its counter, so a scan does not flood the feed.
+
+The 13 rules are written for this plant ([`config/suricata/rules/local.rules`](config/suricata/rules/local.rules)):
+
+| Threat | What triggers the alert | Severity |
+|---|---|---|
+| **PLC tampering** | Any Modbus write to the PLC (the gateway only reads) | critical |
+| | Modbus diagnostic/restart command (function code 08) | critical |
+| | PLC fingerprinting (function code 43, Read Device ID) | warning |
+| | Malformed Modbus request (fuzzing) | warning |
+| **Unauthorized access** | Connection attempt from the cloud into the plant | critical |
+| | Ping from a device on the plant network | warning |
+| | Port scan from the plant network (5+ SYN in 3 s) | critical |
+| | SSH or Telnet attempt into the plant | critical |
+| | DNS query from the plant (it has no reason to resolve names) | warning |
+| **Data leak** | Plaintext MQTT on port 1883 (only TLS on 8883 is allowed) | critical |
+| | Plant traffic heading outside the two project networks | critical |
+| **Denial of service** | Modbus flood: 25+ requests in 2 s (the gateway polls once per second) | critical |
+| | SYN flood against the plant: 30+ SYN in 3 s | critical |
+
+### Simulate attacks
+
+Paste these from the repository root with the stack up and the dashboard open. Each one shows up in
+the feed within a couple of seconds. The `docker run` commands start a throwaway "rogue device"
+plugged into the plant network. The `docker compose exec edge-gateway` commands act as a
+compromised gateway.
 
 ```bash
+# 1. Rogue device pings the gateway                         -> ICMP probe (warning)
 docker run --rm --network factorysense_plant_net alpine:3.24 ping -c 2 edge-gateway
+
+# 2. Rogue device scans 60 ports                            -> port scan + SYN flood (critical)
+docker run --rm --network factorysense_plant_net alpine:3.24 sh -c 'for p in $(seq 1000 1060); do nc -z -w 1 edge-gateway $p; done'
+
+# 3. Rogue device tries SSH                                 -> SSH/Telnet attempt (critical)
+docker run --rm --network factorysense_plant_net alpine:3.24 nc -z -w 2 edge-gateway 22
+
+# 4. Rogue device sends a DNS query                         -> DNS on the plant (warning)
+docker run --rm --network factorysense_plant_net alpine:3.24 nslookup -timeout=2 google.com edge-gateway
+
+# 5. Write to the read-only PLC                             -> PLC tampering (critical)
 docker compose exec edge-gateway python -c "from pymodbus.client import ModbusTcpClient as C; c = C('simulator', port=502); c.connect(); c.write_register(0, 1)"
-docker compose exec ids grep -o '"signature":"[^"]*"' /var/log/suricata/eve.json
+
+# 6. Fingerprint the PLC (function code 43)                 -> fingerprinting (warning)
+docker compose exec edge-gateway python -c "from pymodbus.client import ModbusTcpClient as C; c = C('simulator', port=502); c.connect(); c.read_device_information()"
+
+# 7. Send a diagnostic command (function code 08)           -> diagnostic command (critical)
+docker compose exec edge-gateway python -c "from pymodbus.client import ModbusTcpClient as C; c = C('simulator', port=502); c.connect(); c.diag_read_diagnostic_register()"
+
+# 8. Flood the PLC with 100 requests                        -> Modbus flood (critical)
+docker compose exec edge-gateway python -c "from pymodbus.client import ModbusTcpClient as C; c = C('simulator', port=502); c.connect(); [c.read_input_registers(0, count=3) for _ in range(100)]"
+
+# 9. Try MQTT without TLS (connection refused is expected)  -> plaintext MQTT (critical)
+docker compose exec edge-gateway python -c "import socket; socket.create_connection(('mosquitto', 1883), timeout=2)"
 ```
 
-**WAN outage**: the gateway stays up while the broker is down.
+### Simulate failures
+
+The simulator has fault scenarios. Each one runs normally for 30 s, then pushes one metric out of
+range until the threshold is crossed, and the alert appears in the feed with source `equipment`.
+Run one scenario at a time and go back to `normal` before the next. Back to normal, every open
+alert resolves by itself within a few seconds. The times below are measured from the moment the
+command is run.
 
 ```bash
-docker compose stop mosquitto
-docker compose ps edge-gateway   # still healthy
-docker compose start mosquitto
+# 1. Overheating: temperature climbs to ~100 °C             -> High Temperature Warning (~40 s),
+#                                                              Critical High Temperature + Edge local alarm (~60 s)
+SIMULATION_SCENARIO=overheating docker compose up -d --no-deps simulator
+
+# 2. Worn bearing: vibration climbs to ~7.8 mm/s            -> High Vibration Warning (~50 s),
+#                                                              Critical High Vibration (~60 s)
+SIMULATION_SCENARIO=vibration docker compose up -d --no-deps simulator
+
+# 3. Leak: pressure drops to ~3.0 bar                       -> Critical Hydraulic Pressure Out of Range (~50 s)
+SIMULATION_SCENARIO=pressure-drop docker compose up -d --no-deps simulator
+
+# 4. Blocked line: pressure rises to ~5.7 bar               -> Critical Hydraulic Pressure Out of Range (~50 s)
+SIMULATION_SCENARIO=pressure-spike docker compose up -d --no-deps simulator
+
+# 5. PLC goes offline                                       -> Sensor Silence / Loss of Signal (~15 s)
+docker compose stop simulator
+docker compose start simulator                              # data flows again and the alert resolves
+
+# Back to normal after scenarios 1-4
+SIMULATION_SCENARIO=normal docker compose up -d --no-deps simulator
 ```
 
-## How it works
+The overheating alarm is raised twice on purpose. The gateway raises "Edge local alarm" by itself,
+so it works even without the cloud, and the cloud rules engine raises its own alert from the
+telemetry. Thresholds are in [Design decisions](#design-decisions).
 
-1. `simulator` holds sensor values in Modbus input registers; `edge-gateway` reads them.
-2. The gateway publishes JSON readings to `factorysense/telemetry/<site>/<machine>` over TLS on
-   port 8883. The timestamp travels in the payload (`ts`), so data buffered during an outage
-   keeps its original time when it is sent later.
-3. `ingestor` writes each reading into the `telemetry` hypertable. TimescaleDB rolls it up hourly
-   into `telemetry_1h` and drops raw data after 30 days (rollups after 365).
-4. `rules-engine` evaluates the same stream, the gateway's own alarm transitions
-   (`factorysense/status/...`) and Suricata's `eve.json`, and stores alerts with a `source` of
-   `equipment` or `ids`. Its thresholds are calibrated against the simulator's normal profile and
-   use hysteresis like the gateway: temperature alerts open at 75 °C but only resolve below 73 °C,
-   vibration at 4 / below 3.5 mm/s, pressure outside 3.5–5.0 / back within 3.7–4.8 bar, and a
-   critical only drops to warning 2 °C (0.5 mm/s) below its threshold. A value hovering at a
-   threshold therefore keeps one alert open instead of opening and closing one every second.
-   Alerts are dated with the reading's own `ts`, so readings replayed after a WAN outage produce
-   alerts at the time the condition happened, not when the cloud processed them (the sensor-silence
-   alert is the exception: it is about arrival, so it uses arrival time).
-5. A database trigger `NOTIFY`s every alert change; each `api` replica `LISTEN`s and pushes it to
-   its dashboards over a WebSocket, so the alert feed is live without polling.
-6. `proxy` terminates TLS and exposes the API at `/api` and the dashboard at `/`. Analysts can
-   acknowledge or resolve alerts; an acknowledged alert stays open, keeps counting repeats and
-   still auto-resolves when the reading returns to normal.
+### Check alerts from the terminal
 
-**Security layers**, outside in: HTTPS only (HTTP redirects); security headers and a strict CSP
-on the dashboard; per-IP rate limits (5 logins per minute), body-size and concurrency caps at the
-proxy; scrypt password hashes and server-side sessions in an `HttpOnly`, `Secure`,
-`SameSite=Strict` cookie (logout and account deactivation take effect at once); admin-only user
-management with no public sign-up; and a least-privilege `api` database role that can read
-telemetry and alerts but only change an alert's workflow columns.
+The same alerts can be read and handled through the API with `curl`:
 
-Configuration lives in [`.env`](.env), committed with demo values only. No certificates or keys
-are committed: they are generated on first start.
+```bash
+# Log in (stores the session cookie)
+curl -sk -c /tmp/fs-cookie -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"change-me-admin-password"}' https://localhost/api/auth/login
+
+# List the network alerts (attacks) and the equipment alerts (failures)
+curl -sk -b /tmp/fs-cookie 'https://localhost/api/alerts?source=ids' | grep -o '"rule_name":"[^"]*"'
+curl -sk -b /tmp/fs-cookie 'https://localhost/api/alerts?source=equipment' | grep -o '"rule_name":"[^"]*"'
+
+# Acknowledge or resolve one (replace 1 with an alert id)
+curl -sk -b /tmp/fs-cookie -X PATCH -H 'Content-Type: application/json' \
+  -d '{"status":"acknowledged"}' https://localhost/api/alerts/1
+```
+
+To see what Suricata itself logged:
+`docker compose exec ids grep -o '"signature":"[^"]*"' /var/log/suricata/eve.json`.
+
+## Tests
+
+```bash
+# Gateway unit tests
+docker compose run --rm --no-deps -T -v "$PWD/services/edge-gateway:/work/gateway:ro" \
+  --entrypoint python edge-gateway -m unittest discover -s /work/gateway/tests -v
+
+# Broker: TLS, authentication, ACL, persistence (uses its own throwaway containers)
+docker compose build edge-gateway && python3 config/mosquitto/tests/run.py
+
+# Ingestion: validation, old timestamps, database outage recovery (throwaway containers)
+python3 config/telegraf/tests/run.py
+```
 
 ## Repository layout
 
 ```
-docker-compose.yml     all services, networks, volumes and healthchecks
-services/              custom code: simulator, edge-gateway, rules-engine, api, frontend
-config/                configuration of the off-the-shelf components
-  mosquitto/           broker config, ACL, user and certificate bootstrap
-  telegraf/            MQTT -> validation -> database pipeline and integration tests
-  timescaledb/init/    telemetry hypertable, rollup, retention; alerts; users, sessions, api role
-  suricata/            IDS config and local rules
-  traefik/             proxy config and shared middlewares
-docs/architecture.mmd  architecture diagram
+docker-compose.yml    all services, networks, volumes and healthchecks
+.env                  configuration (demo values only)
+services/             our code: simulator, edge-gateway, rules-engine, api, frontend
+config/               configuration for mosquitto, telegraf, timescaledb, suricata, traefik
+docs/                 architecture diagram
 ```
 
-## Limits
+## Limitations
 
-- **Prototype, not production.** Single host, one broker, one database: no high availability.
-- **Fixed thresholds.** The rules engine uses fixed thresholds with hysteresis: the adaptive
-  baseline and alert escalation are TODO. It evaluates any numeric field it receives, even in a
-  reading the ingestor rejects as incomplete, so such an alert has no matching telemetry row.
-- **Security shortcuts.** Both certificates are self-signed and throwaway (MQTT CA, and Traefik's
-  default HTTPS certificate, hence the browser warning and no HSTS). Only `api` has a
-  least-privilege database role; `ingestor` and `rules-engine` still use the database owner.
-  Traffic inside `cloud_net` (proxy to api, services to database) is not encrypted. Traefik mounts
-  the Docker socket read-only to discover replicas, which is root-equivalent access.
-- **Demo credentials are public.** `.env` is committed so the stack runs right after a clone; every
-  `change-me` password in it is known to anyone with the repository. Replace them before exposing
-  the stack, and do not commit real credentials (or untrack `.env` with `git rm --cached .env`).
-- **Trusted forwarding headers.** The api trusts `X-Forwarded-For` from any peer to log client
-  IPs; only Traefik reaches it, but another `cloud_net` container could spoof the logged IP.
-- **Rate limits are per proxy instance** and in memory: fine for one Traefik, not shared across
-  several. Behind NAT, all clients share one IP and therefore one limit.
-- **IDS visibility.** Suricata only sees traffic on the gateway, and not MQTT topics or payloads
-  because of TLS. Unauthorised topics are silently dropped by the broker ACL instead.
-- **The PLC accepts Modbus writes**, like most real PLCs. Read-only is the gateway's policy;
-  writes are detected, not prevented.
-- **No push notifications** (email, SMS, chat): future work.
-- **Licence.** TimescaleDB Community edition is free but under the Timescale License, not an
-  OSI-approved licence.
-- **Fixed subnets** `172.28.10.0/24` and `172.28.20.0/24`; change them in `docker-compose.yml` and
-  `config/suricata/suricata.yaml` if they clash with your network.
-- Tested on Linux (Docker 29, Compose 5.5).
-
-## Troubleshooting
-
-- **Port 80 or 443 in use**: set `PROXY_HTTP_PORT` / `PROXY_HTTPS_PORT` in `.env`. The HTTP
-  redirect always targets port 443, so with another HTTPS port open https://localhost:<port> directly.
-- **Database schema changed after a pull** (e.g. `relation "users" does not exist`): init scripts
-  only run on an empty volume. Recreate just the database with
-  `docker compose rm -sf timescaledb && docker volume rm factorysense_timescaledb-data && docker compose up -d --wait`.
-- **Build fails with `lookup registry-1.docker.io: i/o timeout`**: your active buildx builder
-  cannot resolve DNS. Run `docker buildx use default` and build again.
-- **Changed a database setting and nothing happened**: database initialization settings only
-  apply when the database volume is first created. Update an existing database explicitly,
-  or reset its volume only if you intend to discard its data.
-- **Certificate bootstrap refuses to start**: check its logs for missing material, expiry,
-  hostname mismatch or a mismatched key. Restore the matching certificate/key/CA set, or
-  deliberately rotate both `mqtt-tls-server` and `mqtt-tls-ca` volumes together while the
-  MQTT services are stopped, then recreate the services. Clients must reload the new CA.
-  Do not remove the database or gateway-buffer volumes to repair certificates.
+- Traffic inside `cloud_net` (proxy → API, services → database) is not encrypted, and only the API
+  has a restricted database role.
+- The PLC accepts Modbus writes; the IDS detects them but does not block them.

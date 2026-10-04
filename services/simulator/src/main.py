@@ -54,11 +54,17 @@ SIMULATION_PROFILES = {
 }
 
 
-# Overheating adds a bounded temperature offset after an initial normal period.
+# Fault scenarios add a bounded, gradual offset to one measurement after an initial normal period.
 # These are demonstration settings, not equipment limits or alert thresholds.
-OVERHEATING_START_S = 30.0
-OVERHEATING_RATE_C_PER_S = 0.5
-OVERHEATING_MAX_RISE_C = 30.0
+FAULT_START_S = 30.0
+FAULT_SCENARIOS = {
+    # name: (measurement, change per second, maximum total change)
+    "overheating": ("temperature", 0.5, 30.0),     # levels off near 100 degC
+    "vibration": ("vibration", 0.2, 7.0),          # worn bearing: levels off near 7.8 mm/s
+    "pressure-drop": ("pressure", -0.05, -1.2),    # leak: levels off near 3.0 bar
+    "pressure-spike": ("pressure", 0.05, 1.5),     # blocked line: levels off near 5.7 bar
+}
+SCENARIOS = ("normal", *FAULT_SCENARIOS)
 
 
 def generate_measurements(
@@ -71,11 +77,11 @@ def generate_measurements(
 
     A sine wave provides a smooth cycle; bounded random noise adds small variations.
     Pass a seeded random.Random instance to reproduce a sequence for demonstrations
-    or checks. "overheating" adds a gradual, capped rise to temperature only.
+    or checks. A fault scenario adds a gradual, capped change to one measurement only.
     This function does not encode values, write registers or wait.
     """
-    if scenario not in ("normal", "overheating"):
-        raise ValueError("SIMULATION_SCENARIO must be 'normal' or 'overheating'")
+    if scenario not in SCENARIOS:
+        raise ValueError(f"SIMULATION_SCENARIO must be one of {', '.join(SCENARIOS)}")
     if not math.isfinite(elapsed_s) or elapsed_s < 0:
         raise ValueError("elapsed_s must be finite and nonnegative")
     noise_source = rng if rng is not None else random
@@ -87,13 +93,11 @@ def generate_measurements(
         noise = noise_source.uniform(-profile["noise"], profile["noise"])
         readings[measurement] = profile["baseline"] + cycle + noise
 
-    if scenario == "overheating":
-        overheating_elapsed_s = max(0.0, elapsed_s - OVERHEATING_START_S)
-        extra_temperature = min(
-            overheating_elapsed_s * OVERHEATING_RATE_C_PER_S,
-            OVERHEATING_MAX_RISE_C,
-        )
-        readings["temperature"] += extra_temperature
+    if scenario in FAULT_SCENARIOS:
+        measurement, rate_per_s, max_change = FAULT_SCENARIOS[scenario]
+        change = max(0.0, elapsed_s - FAULT_START_S) * rate_per_s
+        # max_change carries the direction: cap a rise from above and a drop from below.
+        readings[measurement] += min(change, max_change) if max_change > 0 else max(change, max_change)
     return readings
 
 
@@ -185,7 +189,8 @@ if __name__ == "__main__":
     log.info("starting machine_id=%s modbus_port=%d", MACHINE_ID, MODBUS_PORT)
     log.info("input_register_map=%s", INPUT_REGISTER_MAP)
     log.info("simulation_scenario=%s", SIMULATION_SCENARIO)
-    if SIMULATION_SCENARIO == "overheating":
-        log.info("overheating start_s=%s rate_c_per_s=%s max_rise_c=%s",
-                 OVERHEATING_START_S, OVERHEATING_RATE_C_PER_S, OVERHEATING_MAX_RISE_C)
+    if SIMULATION_SCENARIO in FAULT_SCENARIOS:
+        measurement, rate_per_s, max_change = FAULT_SCENARIOS[SIMULATION_SCENARIO]
+        log.info("fault measurement=%s start_s=%s rate_per_s=%s max_change=%s",
+                 measurement, FAULT_START_S, rate_per_s, max_change)
     asyncio.run(run_simulator())

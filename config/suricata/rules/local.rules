@@ -60,7 +60,9 @@ alert ip $PLANT_NET any -> ![$HOME_NET,224.0.0.0/4,255.255.255.255] any (msg:"FA
 # ------------------------------------------------------------------------------
 
 # 4.1 Modbus query flood (exceeding normal 1 Hz polling rate, see gateway POLL_INTERVAL_S)
-alert tcp any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE ALERT: Modbus request flood on PLC [Denial of Service]"; threshold:type both, track by_dst, count 25, seconds 2; classtype:attempted-dos; priority:1; sid:1000016; rev:1;)
+# flow/dsize make it a per-packet rule: without them Suricata treats it as "ip only" and
+# evaluates it once per connection, so a flood over one connection never reaches the count.
+alert tcp any any -> any $MODBUS_PORTS (msg:"FACTORYSENSE ALERT: Modbus request flood on PLC [Denial of Service]"; flow:established,to_server; dsize:>0; threshold:type both, track by_dst, count 25, seconds 2; classtype:attempted-dos; priority:1; sid:1000016; rev:2;)
 
 # 4.2 TCP SYN flood attempt against the OT boundary.
 # Scoped to $PLANT_NET (not any->any) and thresholded for this stack's normal
