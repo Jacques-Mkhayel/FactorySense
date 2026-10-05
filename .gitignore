@@ -1,4 +1,5 @@
-# Secrets. .env is committed on purpose with demo values only (see README "Limits").
+# Secrets. Keep local credentials out of Git; commit only the demo .env.example.
+.env
 config/mosquitto/certs/
 
 # Python

@@ -55,6 +55,7 @@ connects outward. A more detailed diagram is in [`docs/architecture.mmd`](docs/a
 Requirements: Docker with Compose v2, ports 80 and 443 free.
 
 ```bash
+cp .env.example .env
 docker compose up -d --build --wait
 docker compose ps        # 10 services healthy; mqtt-certs "Exited (0)" is expected
 ```
@@ -65,7 +66,10 @@ Open https://localhost, accept the self-signed certificate and sign in as admini
 |---|---|
 | `admin` | `change-me-admin-password` |
 
-These are the demo values of `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`. More users can be created
+The template contains public demo credentials. Replace the passwords in your local `.env` before
+any real deployment; `.env` is ignored by Git.
+
+These are the demo values of `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env.example`. More users can be created
 in the **Users** tab. API docs: https://localhost/api/docs.
 
 `docker compose down` stops the stack and keeps the data; `docker compose down -v` resets everything.
@@ -292,7 +296,8 @@ python3 config/telegraf/tests/run.py
 
 ```
 docker-compose.yml    all services, networks, volumes and healthchecks
-.env                  configuration (demo values only)
+.env.example          configuration template (demo values only)
+.env                  local configuration (ignored by Git)
 services/             our code: simulator, edge-gateway, rules-engine, api, frontend
 config/               configuration for mosquitto, telegraf, timescaledb, suricata, traefik
 docs/                 architecture diagram
