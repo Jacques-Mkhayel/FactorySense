@@ -1,5 +1,7 @@
 # FactorySense
 
+![FactorySense dashboard](pictures/dashboard.jpeg)
+
 Industrial IoT monitoring on a hybrid edge/cloud architecture. A simulated machine (PLC) produces
 temperature, pressure and vibration; an edge gateway reads it and sends the data to the cloud over
 MQTT/TLS; the cloud stores it, raises equipment and intrusion alerts, and shows them in a
